@@ -1,0 +1,60 @@
+[package]
+name = "igw"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Industrial Gateway - Universal SCADA Protocol Library for Rust"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lyf-dev/igw"
+keywords = ["scada", "industrial", "modbus", "iec104", "protocols"]
+categories = ["embedded", "network-programming", "hardware-support"]
+readme = "README.md"
+
+[features]
+default = ["modbus"]
+
+# Protocol support
+modbus = []
+iec104 = []
+dnp3 = []
+opcua = []
+
+# Transport options
+serial = ["dep:tokio-serial"]
+
+# Utilities
+tracing-support = ["dep:tracing"]
+
+# Full feature set
+full = ["modbus", "iec104", "dnp3", "opcua", "serial", "tracing-support"]
+
+[dependencies]
+# Core async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Byte manipulation
+bytes = "1"
+
+# Optional: Serial port support
+tokio-serial = { version = "5", optional = true }
+
+# Optional: Tracing
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
