@@ -7,16 +7,18 @@ A universal SCADA protocol library for Rust, providing unified abstractions for 
 - **Protocol Agnostic**: Unified four-remote (T/S/C/A) data model
 - **Dual Mode Support**: Polling and event-driven communication
 - **Zero Business Coupling**: Pure protocol layer, no business logic dependencies
-- **Feature Gated**: Compile only what you need
+- **Modular Design**: Protocol implementations in separate crates (pluggable)
 
 ## Supported Protocols
 
-| Protocol | Feature Flag | Status |
-|----------|--------------|--------|
-| Modbus TCP/RTU | `modbus` (default) | Implemented |
-| IEC 60870-5-104 | `iec104` | Planned |
-| DNP3 | `dnp3` | Planned |
-| OPC UA | `opcua` | Planned |
+Protocol implementations are in separate crates:
+
+| Protocol | Crate | Status |
+|----------|-------|--------|
+| Modbus TCP/RTU | `voltage_modbus` | Available |
+| IEC 60870-5-104 | `voltage_iec104` | Planned |
+| DNP3 | `voltage_dnp3` | Planned |
+| OPC UA | `voltage_opcua` | Planned |
 
 ## Installation
 
@@ -24,21 +26,20 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-igw = "0.1"
-
-# Or with specific features
-igw = { version = "0.1", features = ["modbus", "iec104"] }
+igw = "0.1"                    # Core traits and data model
+voltage_modbus = "0.1"         # Modbus support (optional)
+# voltage_iec104 = "0.1"       # IEC 104 support (optional)
 ```
 
 ## Quick Start
 
 ```rust
 use igw::prelude::*;
-use igw::protocols::modbus::ModbusTcpClient;
+use voltage_modbus::ModbusTcpClient;  // Protocol from separate crate
 
 #[tokio::main]
 async fn main() -> igw::Result<()> {
-    // Create a Modbus TCP client
+    // Create a Modbus TCP client (implements igw::ProtocolClient)
     let mut client = ModbusTcpClient::new("192.168.1.100:502")?;
 
     // Connect to the device
@@ -60,7 +61,7 @@ async fn main() -> igw::Result<()> {
 
 ## Data Model
 
-The library uses the "Four Remotes" (四遥) concept common in SCADA systems:
+The library uses the "Four Remotes" concept common in SCADA systems:
 
 | Type | Code | Direction | Description |
 |------|------|-----------|-------------|
@@ -91,6 +92,15 @@ pub trait ProtocolClient: Protocol {
     async fn write_adjustment(&mut self, adjustments: &[AdjustmentCommand]) -> Result<WriteResult>;
     async fn start_polling(&mut self, config: PollingConfig) -> Result<()>;
     async fn stop_polling(&mut self) -> Result<()>;
+}
+```
+
+### `EventDrivenProtocol` (For IEC 104, OPC UA)
+
+```rust
+pub trait EventDrivenProtocol: Protocol {
+    fn subscribe(&self) -> DataEventReceiver;
+    fn set_event_handler(&mut self, handler: Arc<dyn DataEventHandler>);
 }
 ```
 

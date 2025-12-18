@@ -6,18 +6,12 @@ rust-version = "1.75"
 description = "Industrial Gateway - Universal SCADA Protocol Library for Rust"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lyf-dev/igw"
-keywords = ["scada", "industrial", "modbus", "iec104", "protocols"]
+keywords = ["scada", "industrial", "protocols", "four-remote", "gateway"]
 categories = ["embedded", "network-programming", "hardware-support"]
 readme = "README.md"
 
 [features]
-default = ["modbus"]
-
-# Protocol support
-modbus = []
-iec104 = []
-dnp3 = []
-opcua = []
+default = []
 
 # Transport options
 serial = ["dep:tokio-serial"]
@@ -26,7 +20,7 @@ serial = ["dep:tokio-serial"]
 tracing-support = ["dep:tracing"]
 
 # Full feature set
-full = ["modbus", "iec104", "dnp3", "opcua", "serial", "tracing-support"]
+full = ["serial", "tracing-support"]
 
 [dependencies]
 # Core async runtime

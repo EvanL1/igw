@@ -14,8 +14,9 @@
 //!
 //! ```rust,ignore
 //! use igw::prelude::*;
+//! use voltage_modbus::ModbusTcpClient;  // Protocol from separate crate
 //!
-//! // Create a Modbus TCP client
+//! // Create a Modbus TCP client (implements igw::ProtocolClient)
 //! let mut client = ModbusTcpClient::new("192.168.1.100:502")?;
 //! client.connect().await?;
 //!
@@ -25,21 +26,19 @@
 //!
 //! ## Supported Protocols
 //!
-//! | Protocol | Feature Flag | Status |
-//! |----------|--------------|--------|
-//! | Modbus TCP/RTU | `modbus` | Implemented |
-//! | IEC 60870-5-104 | `iec104` | Planned |
-//! | DNP3 | `dnp3` | Planned |
-//! | OPC UA | `opcua` | Planned |
+//! Protocol implementations are in separate crates:
+//!
+//! | Protocol | Crate | Status |
+//! |----------|-------|--------|
+//! | Modbus TCP/RTU | `voltage_modbus` | Available |
+//! | IEC 60870-5-104 | `voltage_iec104` | Planned |
+//! | DNP3 | `voltage_dnp3` | Planned |
+//! | OPC UA | `voltage_opcua` | Planned |
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod core;
 pub mod codec;
-
-#[cfg(feature = "modbus")]
-#[cfg_attr(docsrs, doc(cfg(feature = "modbus")))]
-pub mod protocols;
 
 /// Prelude module for convenient imports
 pub mod prelude {
@@ -50,9 +49,6 @@ pub mod prelude {
         quality::*,
         error::{GatewayError, Result},
     };
-
-    #[cfg(feature = "modbus")]
-    pub use crate::protocols::modbus::*;
 }
 
 // Re-export core types at crate root for convenience
