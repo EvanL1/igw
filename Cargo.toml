@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.75"
 description = "Industrial Gateway - Universal SCADA Protocol Library for Rust"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/lyf-dev/igw"
+repository = "https://github.com/EvanL1/igw"
 keywords = ["scada", "industrial", "protocols", "four-remote", "gateway"]
 categories = ["embedded", "network-programming", "hardware-support"]
 readme = "README.md"
@@ -17,6 +17,13 @@ default = []
 modbus = ["dep:voltage_modbus"]
 iec104 = ["dep:voltage_iec104"]
 j1939 = ["dep:socketcan"]
+opcua = ["dep:async-opcua"]
+
+# Virtual channel (no external deps)
+virtual-channel = []
+
+# GPIO support (Linux only, stub implementation for other platforms)
+gpio = []
 
 # Transport options
 serial = ["dep:tokio-serial"]
@@ -25,7 +32,7 @@ serial = ["dep:tokio-serial"]
 tracing-support = ["dep:tracing"]
 
 # Full feature set
-full = ["modbus", "iec104", "j1939", "serial", "tracing-support"]
+full = ["modbus", "iec104", "j1939", "opcua", "serial", "tracing-support", "virtual-channel", "gpio"]
 
 [dependencies]
 # Core async runtime
@@ -55,10 +62,13 @@ tokio-serial = { version = "5", optional = true }
 tracing = { version = "0.1", optional = true }
 
 # Optional: Modbus protocol support
-voltage_modbus = { path = "../voltage-modbus", optional = true }
+voltage_modbus = { version = "0.4", path = "deps/voltage-modbus", optional = true }
 
 # Optional: IEC 60870-5-104 protocol support
-voltage_iec104 = { path = "../voltage-iec104", optional = true }
+voltage_iec104 = { version = "0.1", path = "deps/voltage-iec104", optional = true }
+
+# Optional: OPC UA protocol support
+async-opcua = { version = "0.14", default-features = false, features = ["client"], optional = true }
 
 # Optional: J1939/CAN protocol support (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]

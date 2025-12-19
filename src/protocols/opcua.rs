@@ -1,0 +1,1278 @@
+//! OPC UA protocol adapter.
+//!
+//! This module provides the `OpcUaChannel` adapter that integrates
+//! `async-opcua` with igw's `Protocol`, `ProtocolClient`, and `EventDrivenProtocol` traits.
+//!
+//! OPC UA supports both polling and subscription (event-driven) modes.
+//! This adapter primarily uses the subscription mode for real-time data updates.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use igw::prelude::*;
+//! use igw::protocols::opcua::{OpcUaChannel, OpcUaChannelConfig, SubscriptionConfig};
+//!
+//! let config = OpcUaChannelConfig::new("opc.tcp://192.168.1.100:4840")
+//!     .with_user_identity("admin", "password")
+//!     .with_subscription(SubscriptionConfig::default())
+//!     .with_points(points);
+//!
+//! let mut channel = OpcUaChannel::new(config, store, 1);
+//! channel.connect().await?;
+//! channel.start_polling(PollingConfig::default()).await?;
+//!
+//! // Receive events via subscription
+//! let mut rx = channel.subscribe();
+//! while let Some(event) = rx.recv().await {
+//!     match event {
+//!         DataEvent::DataUpdate(batch) => { /* process data */ }
+//!         _ => {}
+//!     }
+//! }
+//! ```
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use opcua::client::{ClientBuilder, DataChangeCallback, IdentityToken, MonitoredItem, Session};
+use opcua::crypto::SecurityPolicy;
+use opcua::types::{
+    AttributeId, DataValue, Identifier, MessageSecurityMode, MonitoredItemCreateRequest, NodeId,
+    QualifiedName, ReadValueId, StatusCode, TimestampsToReturn, UAString, UserTokenPolicy,
+    Variant, WriteValue,
+};
+use tokio::sync::{mpsc, RwLock};
+
+use crate::core::data::{DataBatch, DataPoint, DataType, Value};
+use crate::core::error::{GatewayError, Result};
+use crate::core::point::{PointConfig, ProtocolAddress};
+use crate::core::quality::Quality;
+use crate::core::traits::{
+    AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
+    DataEventHandler, DataEventReceiver, DataEventSender, Diagnostics, EventDrivenProtocol,
+    PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
+    WriteResult,
+};
+use crate::store::DataStore;
+
+/// OPC UA security policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpcUaSecurityPolicy {
+    /// No security (development/testing only).
+    #[default]
+    None,
+    /// Basic128Rsa15.
+    Basic128Rsa15,
+    /// Basic256.
+    Basic256,
+    /// Basic256Sha256.
+    Basic256Sha256,
+    /// Aes128Sha256RsaOaep.
+    Aes128Sha256RsaOaep,
+    /// Aes256Sha256RsaPss.
+    Aes256Sha256RsaPss,
+}
+
+impl OpcUaSecurityPolicy {
+    /// Convert to opcua SecurityPolicy.
+    fn to_security_policy(self) -> SecurityPolicy {
+        match self {
+            Self::None => SecurityPolicy::None,
+            Self::Basic128Rsa15 => SecurityPolicy::Basic128Rsa15,
+            Self::Basic256 => SecurityPolicy::Basic256,
+            Self::Basic256Sha256 => SecurityPolicy::Basic256Sha256,
+            Self::Aes128Sha256RsaOaep => SecurityPolicy::Aes128Sha256RsaOaep,
+            Self::Aes256Sha256RsaPss => SecurityPolicy::Aes256Sha256RsaPss,
+        }
+    }
+
+    /// Get the security policy URI string.
+    fn to_uri(&self) -> &'static str {
+        match self {
+            Self::None => SecurityPolicy::None.to_uri(),
+            Self::Basic128Rsa15 => SecurityPolicy::Basic128Rsa15.to_uri(),
+            Self::Basic256 => SecurityPolicy::Basic256.to_uri(),
+            Self::Basic256Sha256 => SecurityPolicy::Basic256Sha256.to_uri(),
+            Self::Aes128Sha256RsaOaep => SecurityPolicy::Aes128Sha256RsaOaep.to_uri(),
+            Self::Aes256Sha256RsaPss => SecurityPolicy::Aes256Sha256RsaPss.to_uri(),
+        }
+    }
+}
+
+/// OPC UA message security mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpcUaMessageSecurityMode {
+    /// No security.
+    #[default]
+    None,
+    /// Sign only.
+    Sign,
+    /// Sign and encrypt.
+    SignAndEncrypt,
+}
+
+impl OpcUaMessageSecurityMode {
+    /// Convert to opcua MessageSecurityMode.
+    fn to_message_security_mode(self) -> MessageSecurityMode {
+        match self {
+            Self::None => MessageSecurityMode::None,
+            Self::Sign => MessageSecurityMode::Sign,
+            Self::SignAndEncrypt => MessageSecurityMode::SignAndEncrypt,
+        }
+    }
+}
+
+/// OPC UA identity/authentication configuration.
+#[derive(Debug, Clone)]
+pub enum OpcUaIdentity {
+    /// Anonymous authentication.
+    Anonymous,
+    /// Username/password authentication.
+    UserName {
+        /// Username.
+        username: String,
+        /// Password.
+        password: String,
+    },
+}
+
+impl Default for OpcUaIdentity {
+    fn default() -> Self {
+        Self::Anonymous
+    }
+}
+
+impl OpcUaIdentity {
+    /// Convert to opcua IdentityToken.
+    fn to_identity_token(&self) -> IdentityToken {
+        match self {
+            Self::Anonymous => IdentityToken::Anonymous,
+            Self::UserName { username, password } => {
+                IdentityToken::UserName(username.clone(), password.clone())
+            }
+        }
+    }
+}
+
+/// Subscription configuration for OPC UA.
+#[derive(Debug, Clone)]
+pub struct SubscriptionConfig {
+    /// Publishing interval in milliseconds.
+    pub publishing_interval_ms: u64,
+
+    /// Lifetime count (multiplier of publishing interval).
+    pub lifetime_count: u32,
+
+    /// Keep-alive count.
+    pub keep_alive_count: u32,
+
+    /// Maximum notifications per publish (0 = unlimited).
+    pub max_notifications_per_publish: u32,
+
+    /// Priority (0-255).
+    pub priority: u8,
+
+    /// Whether publishing is enabled.
+    pub publishing_enabled: bool,
+}
+
+impl Default for SubscriptionConfig {
+    fn default() -> Self {
+        Self {
+            publishing_interval_ms: 1000,
+            lifetime_count: 30,
+            keep_alive_count: 10,
+            max_notifications_per_publish: 0,
+            priority: 0,
+            publishing_enabled: true,
+        }
+    }
+}
+
+/// Monitored item configuration.
+#[derive(Debug, Clone)]
+pub struct MonitoredItemConfig {
+    /// Sampling interval in milliseconds (-1 = use subscription publishing interval).
+    pub sampling_interval_ms: i64,
+
+    /// Queue size for buffering values.
+    pub queue_size: u32,
+
+    /// Whether to discard oldest values when queue is full.
+    pub discard_oldest: bool,
+
+    /// Deadband for data change filtering (optional).
+    pub deadband: Option<f64>,
+}
+
+impl Default for MonitoredItemConfig {
+    fn default() -> Self {
+        Self {
+            sampling_interval_ms: -1,
+            queue_size: 10,
+            discard_oldest: true,
+            deadband: None,
+        }
+    }
+}
+
+/// OPC UA channel configuration.
+#[derive(Debug, Clone)]
+pub struct OpcUaChannelConfig {
+    /// Server endpoint URL (e.g., "opc.tcp://192.168.1.100:4840").
+    pub endpoint_url: String,
+
+    /// Application name.
+    pub application_name: String,
+
+    /// Application URI.
+    pub application_uri: String,
+
+    /// Security policy.
+    pub security_policy: OpcUaSecurityPolicy,
+
+    /// Message security mode.
+    pub message_security_mode: OpcUaMessageSecurityMode,
+
+    /// Identity/authentication.
+    pub identity: OpcUaIdentity,
+
+    /// Connection timeout.
+    pub connect_timeout: Duration,
+
+    /// Session timeout.
+    pub session_timeout: Duration,
+
+    /// Request timeout.
+    pub request_timeout: Duration,
+
+    /// Subscription configuration.
+    pub subscription: SubscriptionConfig,
+
+    /// Monitored item configuration.
+    pub monitored_item: MonitoredItemConfig,
+
+    /// Whether to automatically trust server certificates (development only).
+    pub trust_server_certs: bool,
+
+    /// Session retry limit.
+    pub session_retry_limit: u32,
+
+    /// PKI directory path (for certificate storage).
+    pub pki_dir: Option<String>,
+
+    /// Point configurations.
+    pub points: Vec<PointConfig>,
+
+    /// NodeID to point_id mapping (built from points).
+    node_id_mapping: HashMap<String, String>,
+}
+
+impl OpcUaChannelConfig {
+    /// Create a new configuration with the given endpoint URL.
+    pub fn new(endpoint_url: impl Into<String>) -> Self {
+        Self {
+            endpoint_url: endpoint_url.into(),
+            application_name: "igw OPC UA Client".to_string(),
+            application_uri: "urn:igw:opcua:client".to_string(),
+            security_policy: OpcUaSecurityPolicy::None,
+            message_security_mode: OpcUaMessageSecurityMode::None,
+            identity: OpcUaIdentity::Anonymous,
+            connect_timeout: Duration::from_secs(10),
+            session_timeout: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(30),
+            subscription: SubscriptionConfig::default(),
+            monitored_item: MonitoredItemConfig::default(),
+            trust_server_certs: true,
+            session_retry_limit: 3,
+            pki_dir: None,
+            points: Vec::new(),
+            node_id_mapping: HashMap::new(),
+        }
+    }
+
+    /// Set application name.
+    pub fn with_application_name(mut self, name: impl Into<String>) -> Self {
+        self.application_name = name.into();
+        self
+    }
+
+    /// Set application URI.
+    pub fn with_application_uri(mut self, uri: impl Into<String>) -> Self {
+        self.application_uri = uri.into();
+        self
+    }
+
+    /// Set security policy and message security mode.
+    pub fn with_security(
+        mut self,
+        policy: OpcUaSecurityPolicy,
+        mode: OpcUaMessageSecurityMode,
+    ) -> Self {
+        self.security_policy = policy;
+        self.message_security_mode = mode;
+        self
+    }
+
+    /// Set anonymous identity.
+    pub fn with_anonymous_identity(mut self) -> Self {
+        self.identity = OpcUaIdentity::Anonymous;
+        self
+    }
+
+    /// Set username/password identity.
+    pub fn with_user_identity(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.identity = OpcUaIdentity::UserName {
+            username: username.into(),
+            password: password.into(),
+        };
+        self
+    }
+
+    /// Set connection timeout.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Set session timeout.
+    pub fn with_session_timeout(mut self, timeout: Duration) -> Self {
+        self.session_timeout = timeout;
+        self
+    }
+
+    /// Set request timeout.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Set subscription configuration.
+    pub fn with_subscription(mut self, config: SubscriptionConfig) -> Self {
+        self.subscription = config;
+        self
+    }
+
+    /// Set monitored item configuration.
+    pub fn with_monitored_item(mut self, config: MonitoredItemConfig) -> Self {
+        self.monitored_item = config;
+        self
+    }
+
+    /// Set whether to trust server certificates.
+    pub fn with_trust_server_certs(mut self, trust: bool) -> Self {
+        self.trust_server_certs = trust;
+        self
+    }
+
+    /// Set PKI directory.
+    pub fn with_pki_dir(mut self, dir: impl Into<String>) -> Self {
+        self.pki_dir = Some(dir.into());
+        self
+    }
+
+    /// Add point configurations.
+    pub fn with_points(mut self, points: Vec<PointConfig>) -> Self {
+        // Build NodeID mapping from point configs
+        for point in &points {
+            if let ProtocolAddress::OpcUa(addr) = &point.address {
+                let key = make_node_id_key(addr.namespace_index, &addr.node_id);
+                self.node_id_mapping.insert(key, point.id.clone());
+            }
+        }
+        self.points = points;
+        self
+    }
+
+    /// Find point_id by NodeID.
+    pub fn find_point_id(&self, namespace_index: u16, identifier: &str) -> Option<&str> {
+        let key = make_node_id_key(namespace_index, identifier);
+        self.node_id_mapping.get(&key).map(|s| s.as_str())
+    }
+}
+
+/// Create a key for NodeID mapping.
+fn make_node_id_key(namespace_index: u16, identifier: &str) -> String {
+    format!("ns={};{}", namespace_index, identifier)
+}
+
+/// Channel diagnostics information.
+#[derive(Debug, Default)]
+struct ChannelDiagnostics {
+    /// Received data count.
+    recv_count: u64,
+    /// Sent command count.
+    send_count: u64,
+    /// Error count.
+    error_count: u64,
+    /// Last error message.
+    last_error: Option<String>,
+    /// Current subscription ID.
+    subscription_id: Option<u32>,
+    /// Number of monitored items.
+    monitored_items_count: usize,
+    /// Last data received time.
+    last_data_received: Option<std::time::Instant>,
+}
+
+/// OPC UA channel adapter.
+///
+/// This struct wraps an `async-opcua` client and implements
+/// igw's `Protocol`, `ProtocolClient`, and `EventDrivenProtocol` traits.
+pub struct OpcUaChannel<S: DataStore> {
+    /// Configuration.
+    config: OpcUaChannelConfig,
+    /// opcua session.
+    session: Option<Arc<Session>>,
+    /// Data store.
+    store: Arc<S>,
+    /// Channel ID.
+    channel_id: u32,
+    /// Connection state.
+    state: Arc<std::sync::RwLock<ConnectionState>>,
+    /// Diagnostics.
+    diagnostics: Arc<RwLock<ChannelDiagnostics>>,
+    /// Event sender.
+    event_tx: DataEventSender,
+    /// Event receiver (for subscribe()).
+    #[allow(dead_code)]
+    event_rx: Option<DataEventReceiver>,
+    /// Event handler.
+    event_handler: Option<Arc<dyn DataEventHandler>>,
+    /// Current subscription ID.
+    subscription_id: Option<u32>,
+}
+
+impl<S: DataStore + 'static> OpcUaChannel<S> {
+    /// Create a new OPC UA channel.
+    pub fn new(config: OpcUaChannelConfig, store: Arc<S>, channel_id: u32) -> Self {
+        let (event_tx, event_rx) = mpsc::channel(1024);
+
+        // Set point configs in store
+        if !config.points.is_empty() {
+            store.set_point_configs(channel_id, config.points.clone());
+        }
+
+        Self {
+            config,
+            session: None,
+            store,
+            channel_id,
+            state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
+            diagnostics: Arc::new(RwLock::new(ChannelDiagnostics::default())),
+            event_tx,
+            event_rx: Some(event_rx),
+            event_handler: None,
+            subscription_id: None,
+        }
+    }
+
+    /// Set connection state.
+    fn set_state(&self, state: ConnectionState) {
+        if let Ok(mut s) = self.state.write() {
+            *s = state;
+        }
+    }
+
+    /// Get connection state.
+    fn get_state(&self) -> ConnectionState {
+        self.state.read().map(|s| *s).unwrap_or(ConnectionState::Error)
+    }
+
+    /// Record an error.
+    async fn record_error(&self, error: &str) {
+        let mut diag = self.diagnostics.write().await;
+        diag.error_count += 1;
+        diag.last_error = Some(error.to_string());
+    }
+
+    /// Find point config by ID.
+    fn find_point(&self, id: &str) -> Option<&PointConfig> {
+        self.config.points.iter().find(|p| p.id == id)
+    }
+
+    /// Create subscription and add monitored items.
+    pub async fn create_subscription(&mut self) -> Result<u32> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| GatewayError::NotConnected)?;
+
+        let sub_config = &self.config.subscription;
+
+        // Create subscription with data change callback
+        let store = self.store.clone();
+        let channel_id = self.channel_id;
+        let event_tx = self.event_tx.clone();
+        let diagnostics = self.diagnostics.clone();
+        let config = self.config.clone();
+        let event_handler = self.event_handler.clone();
+
+        let subscription_id = session
+            .create_subscription(
+                Duration::from_millis(sub_config.publishing_interval_ms),
+                sub_config.lifetime_count,
+                sub_config.keep_alive_count,
+                sub_config.max_notifications_per_publish,
+                sub_config.priority,
+                sub_config.publishing_enabled,
+                DataChangeCallback::new(move |data_value: DataValue, item: &MonitoredItem| {
+                    // Clone for async block
+                    let store = store.clone();
+                    let event_tx = event_tx.clone();
+                    let diagnostics = diagnostics.clone();
+                    let config = config.clone();
+                    let event_handler = event_handler.clone();
+
+                    // Collect the data we need before spawning
+                    let node_id = item.item_to_monitor().node_id.clone();
+                    let item_data = vec![(node_id, data_value)];
+
+                    tokio::spawn(async move {
+                        handle_data_change(
+                            &config,
+                            &item_data,
+                            &store,
+                            channel_id,
+                            &event_tx,
+                            &diagnostics,
+                            event_handler.as_ref(),
+                        )
+                        .await;
+                    });
+                }),
+            )
+            .await
+            .map_err(|e| GatewayError::Protocol(format!("Failed to create subscription: {}", e)))?;
+
+        self.subscription_id = Some(subscription_id);
+
+        // Update diagnostics
+        {
+            let mut diag = self.diagnostics.write().await;
+            diag.subscription_id = Some(subscription_id);
+        }
+
+        Ok(subscription_id)
+    }
+
+    /// Add monitored items to the subscription.
+    pub async fn add_monitored_items(&mut self) -> Result<usize> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| GatewayError::NotConnected)?;
+
+        let subscription_id = self
+            .subscription_id
+            .ok_or_else(|| GatewayError::Protocol("No active subscription".into()))?;
+
+        // Build monitored item requests
+        let items_to_create: Vec<MonitoredItemCreateRequest> = self
+            .config
+            .points
+            .iter()
+            .filter_map(|point| {
+                if let ProtocolAddress::OpcUa(addr) = &point.address {
+                    let node_id = parse_node_id(&addr.node_id, addr.namespace_index);
+                    Some(node_id.into())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if items_to_create.is_empty() {
+            return Ok(0);
+        }
+
+        let count = items_to_create.len();
+
+        // Create monitored items
+        session
+            .create_monitored_items(subscription_id, TimestampsToReturn::Both, items_to_create)
+            .await
+            .map_err(|e| {
+                GatewayError::Protocol(format!("Failed to create monitored items: {}", e))
+            })?;
+
+        // Update diagnostics
+        {
+            let mut diag = self.diagnostics.write().await;
+            diag.monitored_items_count = count;
+        }
+
+        Ok(count)
+    }
+
+    /// Read node values directly.
+    async fn read_nodes(&self, node_ids: &[NodeId]) -> Result<Vec<DataValue>> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| GatewayError::NotConnected)?;
+
+        let read_value_ids: Vec<ReadValueId> = node_ids
+            .iter()
+            .map(|node_id| ReadValueId {
+                node_id: node_id.clone(),
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                data_encoding: QualifiedName::null(),
+            })
+            .collect();
+
+        session
+            .read(&read_value_ids, TimestampsToReturn::Both, 0.0)
+            .await
+            .map_err(|e| GatewayError::Protocol(format!("Read failed: {}", e)))
+    }
+
+    /// Write node values.
+    async fn write_nodes(&self, write_values: Vec<WriteValue>) -> Result<Vec<StatusCode>> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| GatewayError::NotConnected)?;
+
+        session
+            .write(&write_values)
+            .await
+            .map_err(|e| GatewayError::Protocol(format!("Write failed: {}", e)))
+    }
+}
+
+impl<S: DataStore> ProtocolCapabilities for OpcUaChannel<S> {
+    fn name(&self) -> &'static str {
+        "OPC UA"
+    }
+
+    fn supported_modes(&self) -> &[CommunicationMode] {
+        &[CommunicationMode::EventDriven, CommunicationMode::Hybrid]
+    }
+
+    fn version(&self) -> &'static str {
+        "1.0"
+    }
+}
+
+#[async_trait]
+impl<S: DataStore + 'static> Protocol for OpcUaChannel<S> {
+    fn connection_state(&self) -> ConnectionState {
+        self.get_state()
+    }
+
+    async fn read(&self, request: ReadRequest) -> Result<ReadResponse> {
+        // OPC UA supports direct reading
+        let _session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| GatewayError::NotConnected)?;
+
+        // Determine points to read
+        let points_to_read: Vec<_> = if let Some(ids) = &request.point_ids {
+            self.config
+                .points
+                .iter()
+                .filter(|p| ids.contains(&p.id))
+                .collect()
+        } else if let Some(data_type) = &request.data_type {
+            self.config
+                .points
+                .iter()
+                .filter(|p| &p.data_type == data_type)
+                .collect()
+        } else {
+            self.config.points.iter().collect()
+        };
+
+        if points_to_read.is_empty() {
+            return Ok(ReadResponse::success(DataBatch::new()));
+        }
+
+        // Build NodeId list
+        let node_ids: Vec<NodeId> = points_to_read
+            .iter()
+            .filter_map(|point| {
+                if let ProtocolAddress::OpcUa(addr) = &point.address {
+                    Some(parse_node_id(&addr.node_id, addr.namespace_index))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Execute read
+        let data_values = self.read_nodes(&node_ids).await?;
+
+        // Convert results
+        let mut batch = DataBatch::new();
+        let mut failed_count = 0;
+
+        for (i, dv) in data_values.iter().enumerate() {
+            if i >= points_to_read.len() {
+                break;
+            }
+
+            let point_config = points_to_read[i];
+
+            if let Some(data_point) = convert_data_value_to_point(point_config, dv) {
+                batch.add(data_point);
+            } else {
+                failed_count += 1;
+            }
+        }
+
+        Ok(ReadResponse::partial(batch, failed_count))
+    }
+
+    async fn diagnostics(&self) -> Result<Diagnostics> {
+        let state = self.get_state();
+        let diag = self.diagnostics.read().await;
+
+        Ok(Diagnostics {
+            protocol: self.name().to_string(),
+            connection_state: state,
+            read_count: diag.recv_count,
+            write_count: diag.send_count,
+            error_count: diag.error_count,
+            last_error: diag.last_error.clone(),
+            extra: serde_json::json!({
+                "endpoint_url": self.config.endpoint_url,
+                "application_name": self.config.application_name,
+                "security_policy": format!("{:?}", self.config.security_policy),
+                "subscription_id": diag.subscription_id,
+                "monitored_items_count": diag.monitored_items_count,
+                "points_configured": self.config.points.len(),
+                "last_data_received_secs_ago": diag.last_data_received.map(|t| t.elapsed().as_secs()),
+            }),
+        })
+    }
+}
+
+#[async_trait]
+impl<S: DataStore + 'static> ProtocolClient for OpcUaChannel<S> {
+    async fn connect(&mut self) -> Result<()> {
+        self.set_state(ConnectionState::Connecting);
+
+        // Build client
+        let mut builder = ClientBuilder::new()
+            .application_name(&self.config.application_name)
+            .application_uri(&self.config.application_uri)
+            .session_retry_limit(self.config.session_retry_limit as i32)
+            .create_sample_keypair(true);
+
+        if self.config.trust_server_certs {
+            builder = builder.trust_server_certs(true);
+        }
+
+        if let Some(pki_dir) = &self.config.pki_dir {
+            builder = builder.pki_dir(pki_dir);
+        }
+
+        let mut client = builder
+            .client()
+            .map_err(|e| GatewayError::Config(e.join(", ")))?;
+
+        // Prepare endpoint and identity
+        let identity = self.config.identity.to_identity_token();
+        let security_policy = self.config.security_policy.to_uri();
+        let message_mode = self.config.message_security_mode.to_message_security_mode();
+
+        // Connect to server
+        let (session, event_loop) = client
+            .connect_to_matching_endpoint(
+                (
+                    self.config.endpoint_url.as_str(),
+                    security_policy,
+                    message_mode,
+                    UserTokenPolicy::anonymous(),
+                ),
+                identity,
+            )
+            .await
+            .map_err(|e| {
+                self.set_state(ConnectionState::Error);
+                GatewayError::Connection(e.to_string())
+            })?;
+
+        // Wait for connection to be established
+        session.wait_for_connection().await;
+
+        self.session = Some(session);
+        self.set_state(ConnectionState::Connected);
+
+        // Spawn event loop in background
+        let state = self.state.clone();
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let _handle = event_loop.spawn();
+
+            // Note: The spawned event loop will run until the session is closed.
+            // When the connection is lost, the state will be updated via callbacks.
+            // For now, we just keep running. In a production implementation,
+            // we'd monitor the handle for completion.
+            let _ = state;
+            let _ = event_tx;
+        });
+
+        // Send connection event
+        let _ = self
+            .event_tx
+            .send(DataEvent::ConnectionChanged(ConnectionState::Connected))
+            .await;
+
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> Result<()> {
+        // Delete subscription
+        if let (Some(session), Some(sub_id)) = (&self.session, self.subscription_id) {
+            let _ = session.delete_subscription(sub_id).await;
+        }
+
+        // Disconnect session
+        if let Some(session) = self.session.take() {
+            let _ = session.disconnect().await;
+        }
+
+        self.subscription_id = None;
+        self.set_state(ConnectionState::Disconnected);
+
+        // Send disconnect event
+        let _ = self
+            .event_tx
+            .send(DataEvent::ConnectionChanged(ConnectionState::Disconnected))
+            .await;
+
+        Ok(())
+    }
+
+    async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
+        let mut success_count = 0;
+        let mut failures = Vec::new();
+
+        for cmd in commands {
+            // Find point config
+            let point = match self.find_point(&cmd.id) {
+                Some(p) => p,
+                None => {
+                    failures.push((cmd.id.clone(), "Point not found".into()));
+                    continue;
+                }
+            };
+
+            // Get OPC UA address
+            let opc_addr = match &point.address {
+                ProtocolAddress::OpcUa(addr) => addr,
+                _ => {
+                    failures.push((cmd.id.clone(), "Invalid address type".into()));
+                    continue;
+                }
+            };
+
+            // Apply reverse transform (for boolean values)
+            let value = point.transform.apply_bool(cmd.value);
+
+            // Build write request
+            let node_id = parse_node_id(&opc_addr.node_id, opc_addr.namespace_index);
+            let write_value = WriteValue {
+                node_id,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue::new_now(Variant::Boolean(value)),
+            };
+
+            // Execute write
+            match self.write_nodes(vec![write_value]).await {
+                Ok(results) => {
+                    if results.first().map(|s| s.is_good()).unwrap_or(false) {
+                        success_count += 1;
+                    } else {
+                        failures.push((
+                            cmd.id.clone(),
+                            format!("Write failed: {:?}", results.first()),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    failures.push((cmd.id.clone(), e.to_string()));
+                }
+            }
+        }
+
+        // Update diagnostics
+        {
+            let mut diag = self.diagnostics.write().await;
+            diag.send_count += success_count as u64;
+        }
+
+        Ok(WriteResult {
+            success_count,
+            failures,
+        })
+    }
+
+    async fn write_adjustment(&mut self, adjustments: &[AdjustmentCommand]) -> Result<WriteResult> {
+        let mut success_count = 0;
+        let mut failures = Vec::new();
+
+        for adj in adjustments {
+            // Find point config
+            let point = match self.find_point(&adj.id) {
+                Some(p) => p,
+                None => {
+                    failures.push((adj.id.clone(), "Point not found".into()));
+                    continue;
+                }
+            };
+
+            // Get OPC UA address
+            let opc_addr = match &point.address {
+                ProtocolAddress::OpcUa(addr) => addr,
+                _ => {
+                    failures.push((adj.id.clone(), "Invalid address type".into()));
+                    continue;
+                }
+            };
+
+            // Apply reverse transform
+            let raw_value = point.transform.reverse_apply(adj.value);
+
+            // Build write request
+            let node_id = parse_node_id(&opc_addr.node_id, opc_addr.namespace_index);
+            let write_value = WriteValue {
+                node_id,
+                attribute_id: AttributeId::Value as u32,
+                index_range: UAString::null(),
+                value: DataValue::new_now(Variant::Double(raw_value)),
+            };
+
+            // Execute write
+            match self.write_nodes(vec![write_value]).await {
+                Ok(results) => {
+                    if results.first().map(|s| s.is_good()).unwrap_or(false) {
+                        success_count += 1;
+                    } else {
+                        failures.push((
+                            adj.id.clone(),
+                            format!("Write failed: {:?}", results.first()),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    failures.push((adj.id.clone(), e.to_string()));
+                }
+            }
+        }
+
+        // Update diagnostics
+        {
+            let mut diag = self.diagnostics.write().await;
+            diag.send_count += success_count as u64;
+        }
+
+        Ok(WriteResult {
+            success_count,
+            failures,
+        })
+    }
+
+    async fn start_polling(&mut self, _config: PollingConfig) -> Result<()> {
+        // For OPC UA, "polling" means creating a subscription with monitored items
+        self.create_subscription().await?;
+        self.add_monitored_items().await?;
+        Ok(())
+    }
+
+    async fn stop_polling(&mut self) -> Result<()> {
+        // Delete subscription
+        if let (Some(session), Some(sub_id)) = (&self.session, self.subscription_id.take()) {
+            session
+                .delete_subscription(sub_id)
+                .await
+                .map_err(|e| GatewayError::Protocol(e.to_string()))?;
+        }
+
+        // Clear diagnostics
+        {
+            let mut diag = self.diagnostics.write().await;
+            diag.subscription_id = None;
+            diag.monitored_items_count = 0;
+        }
+
+        Ok(())
+    }
+}
+
+impl<S: DataStore + 'static> EventDrivenProtocol for OpcUaChannel<S> {
+    fn subscribe(&self) -> DataEventReceiver {
+        // Note: This is a stub implementation that creates a new channel.
+        // In a real implementation, we'd need to properly manage subscriptions.
+        let (_tx, rx) = mpsc::channel(1024);
+        rx
+    }
+
+    fn set_event_handler(&mut self, handler: Arc<dyn DataEventHandler>) {
+        self.event_handler = Some(handler);
+    }
+}
+
+// ==================== Helper Functions ====================
+
+/// Parse NodeId from string.
+fn parse_node_id(identifier: &str, namespace_index: u16) -> NodeId {
+    // Support multiple formats:
+    // - "i=1234" -> Numeric identifier
+    // - "s=Temperature" -> String identifier
+    // - Just a string -> String identifier
+
+    if identifier.starts_with("i=") {
+        if let Ok(id) = identifier[2..].parse::<u32>() {
+            return NodeId::new(namespace_index, id);
+        }
+    } else if identifier.starts_with("s=") {
+        return NodeId::new(namespace_index, identifier[2..].to_string());
+    }
+
+    // Default to string identifier
+    NodeId::new(namespace_index, identifier.to_string())
+}
+
+/// Handle data change callback.
+async fn handle_data_change<S: DataStore>(
+    config: &OpcUaChannelConfig,
+    items: &[(NodeId, DataValue)],
+    store: &Arc<S>,
+    channel_id: u32,
+    event_tx: &DataEventSender,
+    diagnostics: &Arc<RwLock<ChannelDiagnostics>>,
+    event_handler: Option<&Arc<dyn DataEventHandler>>,
+) {
+    let mut batch = DataBatch::new();
+
+    for (node_id, data_value) in items {
+        // Find point_id from NodeID
+        let identifier = match &node_id.identifier {
+            Identifier::Numeric(n) => format!("i={}", n),
+            Identifier::String(s) => format!("s={}", s.as_ref()),
+            Identifier::Guid(g) => format!("g={}", g),
+            Identifier::ByteString(b) => {
+                format!("b={:?}", b.value.as_deref().unwrap_or(&[]))
+            }
+        };
+
+        let point_id = config
+            .find_point_id(node_id.namespace, &identifier)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("ns{}_{}", node_id.namespace, identifier));
+
+        // Find point config
+        let point_config = config.points.iter().find(|p| p.id == point_id);
+
+        if let Some(dp) = convert_data_value_with_id(&point_id, point_config, data_value) {
+            batch.add(dp);
+        }
+    }
+
+    if batch.is_empty() {
+        return;
+    }
+
+    // Write to DataStore
+    if let Err(e) = store.write_batch(channel_id, &batch).await {
+        let mut diag = diagnostics.write().await;
+        diag.error_count += 1;
+        diag.last_error = Some(e.to_string());
+        return;
+    }
+
+    // Send event
+    let _ = event_tx.send(DataEvent::DataUpdate(batch.clone())).await;
+
+    // Call event handler
+    if let Some(handler) = event_handler {
+        handler.on_data_update(batch).await;
+    }
+
+    // Update diagnostics
+    let mut diag = diagnostics.write().await;
+    diag.recv_count += 1;
+    diag.last_data_received = Some(std::time::Instant::now());
+}
+
+/// Convert DataValue to DataPoint.
+fn convert_data_value_to_point(config: &PointConfig, dv: &DataValue) -> Option<DataPoint> {
+    convert_data_value_with_id(&config.id, Some(config), dv)
+}
+
+/// Convert DataValue to DataPoint with explicit ID.
+fn convert_data_value_with_id(
+    point_id: &str,
+    config: Option<&PointConfig>,
+    dv: &DataValue,
+) -> Option<DataPoint> {
+    // Get value
+    let value = dv.value.as_ref()?;
+    let igw_value = convert_variant_to_value(value);
+
+    // Convert quality
+    let quality = dv
+        .status
+        .map(convert_status_code_to_quality)
+        .unwrap_or(Quality::Good);
+
+    // Get timestamp
+    let timestamp = Utc::now();
+    let source_timestamp = dv.source_timestamp.as_ref().and_then(opcua_datetime_to_chrono);
+
+    // Determine data type
+    let data_type = config.map(|c| c.data_type).unwrap_or_else(|| {
+        if matches!(igw_value, Value::Bool(_)) {
+            DataType::Signal
+        } else {
+            DataType::Telemetry
+        }
+    });
+
+    // Apply transform if config is available
+    let final_value = if let Some(cfg) = config {
+        if let Some(f) = igw_value.as_f64() {
+            Value::Float(cfg.transform.apply(f))
+        } else if let Some(b) = igw_value.as_bool() {
+            Value::Bool(cfg.transform.apply_bool(b))
+        } else {
+            igw_value
+        }
+    } else {
+        igw_value
+    };
+
+    Some(DataPoint {
+        id: point_id.to_string(),
+        data_type,
+        value: final_value,
+        quality,
+        timestamp,
+        source_timestamp,
+    })
+}
+
+/// Convert OPC UA Variant to igw Value.
+fn convert_variant_to_value(variant: &Variant) -> Value {
+    match variant {
+        Variant::Boolean(v) => Value::Bool(*v),
+        Variant::SByte(v) => Value::Integer(*v as i64),
+        Variant::Byte(v) => Value::Integer(*v as i64),
+        Variant::Int16(v) => Value::Integer(*v as i64),
+        Variant::UInt16(v) => Value::Integer(*v as i64),
+        Variant::Int32(v) => Value::Integer(*v as i64),
+        Variant::UInt32(v) => Value::Integer(*v as i64),
+        Variant::Int64(v) => Value::Integer(*v),
+        Variant::UInt64(v) => Value::Integer(*v as i64),
+        Variant::Float(v) => Value::Float(*v as f64),
+        Variant::Double(v) => Value::Float(*v),
+        Variant::String(v) => Value::String(v.as_ref().to_string()),
+        _ => Value::Null,
+    }
+}
+
+/// Convert OPC UA StatusCode to igw Quality.
+fn convert_status_code_to_quality(status: StatusCode) -> Quality {
+    if status.is_good() {
+        Quality::Good
+    } else if status.is_bad() {
+        Quality::Bad
+    } else {
+        Quality::Uncertain
+    }
+}
+
+/// Convert OPC UA DateTime to chrono DateTime.
+fn opcua_datetime_to_chrono(dt: &opcua::types::DateTime) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp_millis(dt.as_chrono().timestamp_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::MemoryStore;
+
+    #[test]
+    fn test_opcua_config() {
+        let config = OpcUaChannelConfig::new("opc.tcp://localhost:4840")
+            .with_security(
+                OpcUaSecurityPolicy::Basic256Sha256,
+                OpcUaMessageSecurityMode::SignAndEncrypt,
+            )
+            .with_user_identity("user", "pass");
+
+        assert_eq!(config.endpoint_url, "opc.tcp://localhost:4840");
+        assert_eq!(config.security_policy, OpcUaSecurityPolicy::Basic256Sha256);
+        assert_eq!(
+            config.message_security_mode,
+            OpcUaMessageSecurityMode::SignAndEncrypt
+        );
+    }
+
+    #[test]
+    fn test_node_id_parsing() {
+        let node_id = parse_node_id("i=1234", 2);
+        assert_eq!(node_id.namespace, 2);
+
+        let node_id = parse_node_id("s=Temperature", 2);
+        assert_eq!(node_id.namespace, 2);
+
+        let node_id = parse_node_id("Temperature", 2);
+        assert_eq!(node_id.namespace, 2);
+    }
+
+    #[test]
+    fn test_variant_conversion() {
+        let value = convert_variant_to_value(&Variant::Double(25.5));
+        assert_eq!(value.as_f64(), Some(25.5));
+
+        let value = convert_variant_to_value(&Variant::Boolean(true));
+        assert_eq!(value.as_bool(), Some(true));
+
+        let value = convert_variant_to_value(&Variant::Int32(100));
+        assert_eq!(value.as_i64(), Some(100));
+    }
+
+    #[test]
+    fn test_quality_conversion() {
+        let quality = convert_status_code_to_quality(StatusCode::Good);
+        assert_eq!(quality, Quality::Good);
+
+        let quality = convert_status_code_to_quality(StatusCode::BadNodeIdUnknown);
+        assert_eq!(quality, Quality::Bad);
+    }
+
+    #[test]
+    fn test_channel_capabilities() {
+        let store = Arc::new(MemoryStore::new());
+        let config = OpcUaChannelConfig::new("opc.tcp://localhost:4840");
+        let channel = OpcUaChannel::new(config, store, 1);
+
+        assert_eq!(channel.name(), "OPC UA");
+        assert!(channel
+            .supported_modes()
+            .contains(&CommunicationMode::EventDriven));
+        assert!(channel
+            .supported_modes()
+            .contains(&CommunicationMode::Hybrid));
+    }
+
+    #[test]
+    fn test_node_id_key() {
+        let key = make_node_id_key(2, "s=Temperature");
+        assert_eq!(key, "ns=2;s=Temperature");
+    }
+}

@@ -12,14 +12,15 @@ A universal SCADA protocol library for Rust, providing unified abstractions for 
 
 ## Supported Protocols
 
-Protocol implementations are in separate crates:
-
-| Protocol | Crate | Status |
-|----------|-------|--------|
-| Modbus TCP/RTU | `voltage_modbus` | Available |
-| IEC 60870-5-104 | `voltage_iec104` | Planned |
-| DNP3 | `voltage_dnp3` | Planned |
-| OPC UA | `voltage_opcua` | Planned |
+| Protocol | Feature | Status |
+|----------|---------|--------|
+| Modbus TCP/RTU | `modbus` | Available |
+| IEC 60870-5-104 | `iec104` | Available |
+| OPC UA | `opcua` | Available |
+| J1939/CAN | `j1939` | Available (Linux) |
+| GPIO | `gpio` | Available (Linux) |
+| Virtual Channel | `virtual-channel` | Available |
+| DNP3 | - | Planned |
 
 ## Installation
 

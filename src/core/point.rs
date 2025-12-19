@@ -93,8 +93,105 @@ pub enum ProtocolAddress {
     /// DNP3 address.
     Dnp3(Dnp3Address),
 
+    /// Virtual channel address (no physical device).
+    Virtual(VirtualAddress),
+
+    /// GPIO address (for DI/DO hardware control).
+    #[cfg(feature = "gpio")]
+    Gpio(GpioAddress),
+
     /// Generic string address (for custom protocols).
     Generic(String),
+}
+
+/// Virtual channel address.
+///
+/// Used for points that don't connect to a physical device.
+/// Virtual points serve as data aggregation/relay points.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualAddress {
+    /// Logical group name (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+
+    /// Tag/identifier within the group.
+    pub tag: String,
+}
+
+impl VirtualAddress {
+    /// Create a simple virtual address.
+    pub fn new(tag: impl Into<String>) -> Self {
+        Self {
+            group: None,
+            tag: tag.into(),
+        }
+    }
+
+    /// Create a grouped virtual address.
+    pub fn grouped(group: impl Into<String>, tag: impl Into<String>) -> Self {
+        Self {
+            group: Some(group.into()),
+            tag: tag.into(),
+        }
+    }
+}
+
+/// GPIO pin direction.
+#[cfg(feature = "gpio")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpioDirection {
+    /// Input pin (DI - Digital Input).
+    Input,
+    /// Output pin (DO - Digital Output).
+    Output,
+}
+
+/// GPIO address for hardware DI/DO control.
+#[cfg(feature = "gpio")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpioAddress {
+    /// GPIO chip name (e.g., "gpiochip0").
+    pub chip: String,
+
+    /// Pin number/offset.
+    pub pin: u32,
+
+    /// Pin direction.
+    pub direction: GpioDirection,
+
+    /// Active low (invert logic).
+    #[serde(default)]
+    pub active_low: bool,
+}
+
+#[cfg(feature = "gpio")]
+impl GpioAddress {
+    /// Create a digital input address.
+    pub fn digital_input(chip: impl Into<String>, pin: u32) -> Self {
+        Self {
+            chip: chip.into(),
+            pin,
+            direction: GpioDirection::Input,
+            active_low: false,
+        }
+    }
+
+    /// Create a digital output address.
+    pub fn digital_output(chip: impl Into<String>, pin: u32) -> Self {
+        Self {
+            chip: chip.into(),
+            pin,
+            direction: GpioDirection::Output,
+            active_low: false,
+        }
+    }
+
+    /// Set active low mode.
+    pub fn with_active_low(mut self, active_low: bool) -> Self {
+        self.active_low = active_low;
+        self
+    }
 }
 
 /// Modbus point address.

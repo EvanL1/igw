@@ -1,0 +1,6 @@
+[submodule "deps/voltage-modbus"]
+	path = deps/voltage-modbus
+	url = https://github.com/EvanL1/voltage_modbus.git
+[submodule "deps/voltage-iec104"]
+	path = deps/voltage-iec104
+	url = https://github.com/EvanL1/voltage-iec104.git

@@ -34,14 +34,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, TimeZone, Utc};
 use tokio::sync::{mpsc, RwLock};
-use voltage_iec104::{
-    ClientConfig, ConnectionState as Iec104State, Iec104Client, Iec104Event,
-};
+use voltage_iec104::{ClientConfig, Cp56Time2a, Iec104Client, Iec104Event};
 
-use crate::core::data::{DataBatch, DataPoint, DataType, Quality, Value};
+use crate::core::data::{DataBatch, DataPoint, DataType, Value};
 use crate::core::error::{GatewayError, Result};
 use crate::core::point::PointConfig;
+use crate::core::quality::Quality;
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
     DataEventHandler, DataEventReceiver, DataEventSender, Diagnostics, EventDrivenProtocol,
@@ -145,13 +145,14 @@ impl Iec104ChannelConfig {
 
     /// Build voltage_iec104 ClientConfig.
     fn to_client_config(&self) -> ClientConfig {
-        ClientConfig::new(&self.address)
+        let mut config = ClientConfig::new(&self.address)
             .connect_timeout(self.connect_timeout)
             .t1_timeout(self.t1_timeout)
             .t2_timeout(self.t2_timeout)
-            .t3_timeout(self.t3_timeout)
-            .k(self.k)
-            .w(self.w)
+            .t3_timeout(self.t3_timeout);
+        config.k = self.k;
+        config.w = self.w;
+        config
     }
 }
 
@@ -163,9 +164,11 @@ pub struct Iec104Channel<S: DataStore> {
     config: Iec104ChannelConfig,
     client: Iec104Client,
     store: Arc<S>,
+    channel_id: u32,
     state: Arc<std::sync::RwLock<ConnectionState>>,
     diagnostics: Arc<RwLock<ChannelDiagnostics>>,
     event_tx: DataEventSender,
+    #[allow(dead_code)] // Reserved for future use in subscribe()
     event_rx: Option<DataEventReceiver>,
     event_handler: Option<Arc<dyn DataEventHandler>>,
     poll_task: Option<tokio::task::JoinHandle<()>>,
@@ -182,7 +185,7 @@ struct ChannelDiagnostics {
 
 impl<S: DataStore> Iec104Channel<S> {
     /// Create a new IEC 104 channel.
-    pub fn new(config: Iec104ChannelConfig, store: Arc<S>) -> Self {
+    pub fn new(config: Iec104ChannelConfig, store: Arc<S>, channel_id: u32) -> Self {
         let client_config = config.to_client_config();
         let client = Iec104Client::new(client_config);
         let (event_tx, event_rx) = mpsc::channel(1024);
@@ -191,6 +194,7 @@ impl<S: DataStore> Iec104Channel<S> {
             config,
             client,
             store,
+            channel_id,
             state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
             diagnostics: Arc::new(RwLock::new(ChannelDiagnostics::default())),
             event_tx,
@@ -241,17 +245,20 @@ impl<S: DataStore> Iec104Channel<S> {
     }
 
     /// Send counter interrogation command.
-    pub async fn counter_interrogation(&mut self) -> Result<()> {
+    ///
+    /// Group 5 = request group 1 counter interrogation (general)
+    pub async fn counter_interrogation(&mut self, group: u8) -> Result<()> {
         self.client
-            .counter_interrogation(self.config.common_address)
+            .counter_interrogation(self.config.common_address, group)
             .await
             .map_err(|e| GatewayError::Protocol(e.to_string()))
     }
 
     /// Send clock synchronization command.
     pub async fn clock_sync(&mut self) -> Result<()> {
+        let time = cp56time2a_now();
         self.client
-            .clock_sync(self.config.common_address)
+            .clock_sync(self.config.common_address, time)
             .await
             .map_err(|e| GatewayError::Protocol(e.to_string()))
     }
@@ -292,7 +299,7 @@ impl<S: DataStore> Iec104Channel<S> {
                 let batch = self.convert_data_points(points).await;
                 if !batch.is_empty() {
                     // Store to DataStore
-                    if let Err(e) = self.store.write_batch(&batch).await {
+                    if let Err(e) = self.store.write_batch(self.channel_id, &batch).await {
                         self.record_error(&e.to_string()).await;
                     }
 
@@ -351,12 +358,16 @@ impl<S: DataStore> Iec104Channel<S> {
                 DataType::Telemetry
             };
 
+            // Convert source timestamp
+            let source_timestamp = point.timestamp.as_ref().and_then(cp56time2a_to_datetime);
+
             let dp = DataPoint {
                 id: point_id,
                 data_type,
                 value,
                 quality,
-                timestamp: point.timestamp.map(|t| t.to_datetime()),
+                timestamp: Utc::now(),
+                source_timestamp,
             };
 
             batch.add(dp);
@@ -577,7 +588,7 @@ impl<S: DataStore + 'static> ProtocolClient for Iec104Channel<S> {
         // For IEC 104, "polling" means starting a background task that calls poll()
         // and optionally sends periodic general interrogations
 
-        let interval = Duration::from_millis(config.interval_ms);
+        let _interval = Duration::from_millis(config.interval_ms);
 
         // Start data transfer first
         self.start_data_transfer().await?;
@@ -585,9 +596,8 @@ impl<S: DataStore + 'static> ProtocolClient for Iec104Channel<S> {
         // Send initial general interrogation
         self.general_interrogation().await?;
 
-        // Note: The actual poll loop would need to be implemented with
-        // proper channel cloning or task management. For now, we just
-        // indicate that polling has been configured.
+        // TODO: Implement actual poll loop with proper channel cloning or task management
+        // For now, we just indicate that polling has been configured.
 
         Ok(())
     }
@@ -602,10 +612,10 @@ impl<S: DataStore + 'static> ProtocolClient for Iec104Channel<S> {
 
 impl<S: DataStore + 'static> EventDrivenProtocol for Iec104Channel<S> {
     fn subscribe(&self) -> DataEventReceiver {
-        // Note: This consumes the receiver, so only one subscriber is supported
-        // For multiple subscribers, would need broadcast channel
-        let (tx, rx) = mpsc::channel(1024);
-        // In a real implementation, we'd need to clone the sender and manage subscriptions
+        // Note: This is a stub implementation that creates a new channel.
+        // In a real implementation, we'd need to properly manage subscriptions.
+        // The event_rx stored in the struct should be used instead.
+        let (_tx, rx) = mpsc::channel(1024);
         rx
     }
 
@@ -623,7 +633,9 @@ fn convert_iec104_value(value: &voltage_iec104::DataValue) -> Value {
             match dp {
                 DoublePointValue::Off => Value::Bool(false),
                 DoublePointValue::On => Value::Bool(true),
-                _ => Value::Invalid,
+                DoublePointValue::Indeterminate | DoublePointValue::IndeterminateOrFaulty => {
+                    Value::Null
+                }
             }
         }
         voltage_iec104::DataValue::Normalized(v) => Value::Float(*v as f64),
@@ -636,6 +648,44 @@ fn convert_iec104_value(value: &voltage_iec104::DataValue) -> Value {
     }
 }
 
+/// Convert Cp56Time2a to DateTime<Utc>.
+fn cp56time2a_to_datetime(time: &Cp56Time2a) -> Option<DateTime<Utc>> {
+    if time.invalid {
+        return None;
+    }
+
+    // Year is stored as offset from 2000
+    let year = 2000 + time.year as i32;
+    let month = time.month as u32;
+    let day = time.day as u32;
+    let hour = time.hours as u32;
+    let minute = time.minutes as u32;
+    let second = (time.milliseconds / 1000) as u32;
+    let millisecond = (time.milliseconds % 1000) as u32;
+
+    Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
+        .single()
+        .map(|dt| dt + chrono::Duration::milliseconds(millisecond as i64))
+}
+
+/// Create Cp56Time2a from current time.
+fn cp56time2a_now() -> Cp56Time2a {
+    let now = Utc::now();
+
+    Cp56Time2a {
+        milliseconds: (now.timestamp_subsec_millis() as u16)
+            + (now.format("%S").to_string().parse::<u16>().unwrap_or(0) * 1000),
+        minutes: now.format("%M").to_string().parse().unwrap_or(0),
+        hours: now.format("%H").to_string().parse().unwrap_or(0),
+        day: now.format("%d").to_string().parse().unwrap_or(1),
+        day_of_week: now.format("%u").to_string().parse().unwrap_or(1),
+        month: now.format("%m").to_string().parse().unwrap_or(1),
+        year: ((now.format("%Y").to_string().parse::<u16>().unwrap_or(2000) - 2000) & 0x7F) as u8,
+        invalid: false,
+        summer_time: false,
+    }
+}
+
 /// Convert IEC 104 Quality to igw Quality.
 fn convert_iec104_quality(quality: &voltage_iec104::Quality) -> Quality {
     if quality.is_good() {
@@ -643,7 +693,7 @@ fn convert_iec104_quality(quality: &voltage_iec104::Quality) -> Quality {
     } else if quality.invalid {
         Quality::Invalid
     } else {
-        Quality::Questionable
+        Quality::Uncertain
     }
 }
 
@@ -667,7 +717,7 @@ mod tests {
     fn test_iec104_channel_capabilities() {
         let store = Arc::new(MemoryStore::new());
         let config = Iec104ChannelConfig::new("127.0.0.1:2404");
-        let channel = Iec104Channel::new(config, store);
+        let channel = Iec104Channel::new(config, store, 1);
 
         assert_eq!(channel.name(), "IEC 60870-5-104");
         assert!(channel
@@ -689,5 +739,23 @@ mod tests {
             convert_iec104_value(&voltage_iec104::DataValue::Scaled(100)),
             Value::Integer(100)
         );
+    }
+
+    #[test]
+    fn test_cp56time2a_conversion() {
+        let time = Cp56Time2a {
+            milliseconds: 30500, // 30 seconds, 500 ms
+            minutes: 15,
+            hours: 10,
+            day: 25,
+            day_of_week: 3,
+            month: 12,
+            year: 24, // 2024
+            invalid: false,
+            summer_time: false,
+        };
+
+        let dt = cp56time2a_to_datetime(&time).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-12-25 10:15:30");
     }
 }

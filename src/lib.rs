@@ -40,17 +40,7 @@
 pub mod core;
 pub mod codec;
 pub mod store;
-
-#[cfg(any(
-    feature = "modbus",
-    feature = "iec104",
-    all(feature = "j1939", target_os = "linux")
-))]
-#[cfg_attr(docsrs, doc(cfg(any(
-    feature = "modbus",
-    feature = "iec104",
-    all(feature = "j1939", target_os = "linux")
-))))]
+pub mod router;
 pub mod protocols;
 
 /// Prelude module for convenient imports
