@@ -135,13 +135,9 @@ impl DataStore for MemoryStore {
     }
 
     fn get_point_config(&self, channel_id: u32, point_id: &str) -> Option<PointConfig> {
-        self.configs.get(&channel_id).and_then(|configs| {
-            configs
-                .value()
-                .iter()
-                .find(|c| c.id == point_id)
-                .cloned()
-        })
+        self.configs
+            .get(&channel_id)
+            .and_then(|configs| configs.value().iter().find(|c| c.id == point_id).cloned())
     }
 
     fn set_point_configs(&self, channel_id: u32, configs: Vec<PointConfig>) {

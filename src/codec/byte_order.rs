@@ -3,9 +3,9 @@
 //! Provides functions for reading and writing multi-byte values
 //! with configurable byte order.
 
-use crate::core::point::{ByteOrder, DataFormat};
 use crate::core::data::Value;
 use crate::core::error::{GatewayError, Result};
+use crate::core::point::{ByteOrder, DataFormat};
 
 /// Decode a value from 16-bit registers.
 ///
@@ -142,66 +142,66 @@ pub fn encode_registers(
 ) -> Result<Vec<u16>> {
     match format {
         DataFormat::Bool => {
-            let b = value.as_bool().ok_or_else(|| {
-                GatewayError::invalid_data("Cannot convert to bool")
-            })?;
+            let b = value
+                .as_bool()
+                .ok_or_else(|| GatewayError::invalid_data("Cannot convert to bool"))?;
             Ok(vec![if b { 1 } else { 0 }])
         }
 
         DataFormat::UInt16 => {
-            let v = value.as_i64().ok_or_else(|| {
-                GatewayError::invalid_data("Cannot convert to integer")
-            })?;
+            let v = value
+                .as_i64()
+                .ok_or_else(|| GatewayError::invalid_data("Cannot convert to integer"))?;
             Ok(vec![v as u16])
         }
 
         DataFormat::Int16 => {
-            let v = value.as_i64().ok_or_else(|| {
-                GatewayError::invalid_data("Cannot convert to integer")
-            })?;
+            let v = value
+                .as_i64()
+                .ok_or_else(|| GatewayError::invalid_data("Cannot convert to integer"))?;
             Ok(vec![v as i16 as u16])
         }
 
         DataFormat::UInt32 | DataFormat::Int32 => {
-            let v = value.as_i64().ok_or_else(|| {
-                GatewayError::invalid_data("Cannot convert to integer")
-            })?;
+            let v = value
+                .as_i64()
+                .ok_or_else(|| GatewayError::invalid_data("Cannot convert to integer"))?;
             let bytes = (v as u32).to_be_bytes();
             let (r0, r1) = reorder_to_registers_32(bytes, byte_order);
             Ok(vec![r0, r1])
         }
 
         DataFormat::Float32 => {
-            let v = value.as_f64().ok_or_else(|| {
-                GatewayError::invalid_data("Cannot convert to float")
-            })?;
+            let v = value
+                .as_f64()
+                .ok_or_else(|| GatewayError::invalid_data("Cannot convert to float"))?;
             let bytes = (v as f32).to_be_bytes();
             let (r0, r1) = reorder_to_registers_32(bytes, byte_order);
             Ok(vec![r0, r1])
         }
 
         DataFormat::UInt64 | DataFormat::Int64 => {
-            let v = value.as_i64().ok_or_else(|| {
-                GatewayError::invalid_data("Cannot convert to integer")
-            })?;
+            let v = value
+                .as_i64()
+                .ok_or_else(|| GatewayError::invalid_data("Cannot convert to integer"))?;
             let bytes = v.to_be_bytes();
             let regs = reorder_to_registers_64(bytes, byte_order);
             Ok(regs.to_vec())
         }
 
         DataFormat::Float64 => {
-            let v = value.as_f64().ok_or_else(|| {
-                GatewayError::invalid_data("Cannot convert to float")
-            })?;
+            let v = value
+                .as_f64()
+                .ok_or_else(|| GatewayError::invalid_data("Cannot convert to float"))?;
             let bytes = v.to_be_bytes();
             let regs = reorder_to_registers_64(bytes, byte_order);
             Ok(regs.to_vec())
         }
 
         DataFormat::String => {
-            let s = value.as_string().ok_or_else(|| {
-                GatewayError::invalid_data("Cannot convert to string")
-            })?;
+            let s = value
+                .as_string()
+                .ok_or_else(|| GatewayError::invalid_data("Cannot convert to string"))?;
             let mut regs = Vec::new();
             let bytes = s.as_bytes();
             for chunk in bytes.chunks(2) {
@@ -245,13 +245,15 @@ fn reorder_bytes_64(regs: &[u16], order: ByteOrder) -> [u8; 8] {
         }
         ByteOrder::Badc => {
             // Swap within each word
-            [bytes[1], bytes[0], bytes[3], bytes[2],
-             bytes[5], bytes[4], bytes[7], bytes[6]]
+            [
+                bytes[1], bytes[0], bytes[3], bytes[2], bytes[5], bytes[4], bytes[7], bytes[6],
+            ]
         }
         ByteOrder::Cdab => {
             // Swap word pairs
-            [bytes[2], bytes[3], bytes[0], bytes[1],
-             bytes[6], bytes[7], bytes[4], bytes[5]]
+            [
+                bytes[2], bytes[3], bytes[0], bytes[1], bytes[6], bytes[7], bytes[4], bytes[5],
+            ]
         }
     }
 }
@@ -281,14 +283,12 @@ fn reorder_to_registers_64(bytes: [u8; 8], order: ByteOrder) -> [u16; 4] {
             b.reverse();
             b
         }
-        ByteOrder::Badc => {
-            [bytes[1], bytes[0], bytes[3], bytes[2],
-             bytes[5], bytes[4], bytes[7], bytes[6]]
-        }
-        ByteOrder::Cdab => {
-            [bytes[2], bytes[3], bytes[0], bytes[1],
-             bytes[6], bytes[7], bytes[4], bytes[5]]
-        }
+        ByteOrder::Badc => [
+            bytes[1], bytes[0], bytes[3], bytes[2], bytes[5], bytes[4], bytes[7], bytes[6],
+        ],
+        ByteOrder::Cdab => [
+            bytes[2], bytes[3], bytes[0], bytes[1], bytes[6], bytes[7], bytes[4], bytes[5],
+        ],
     };
 
     [

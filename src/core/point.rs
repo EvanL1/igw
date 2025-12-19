@@ -42,11 +42,7 @@ fn default_true() -> bool {
 
 impl PointConfig {
     /// Create a new point configuration.
-    pub fn new(
-        id: impl Into<String>,
-        data_type: DataType,
-        address: ProtocolAddress,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, data_type: DataType, address: ProtocolAddress) -> Self {
         Self {
             id: id.into(),
             name: None,

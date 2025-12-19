@@ -86,6 +86,7 @@ impl ModbusChannelConfig {
 pub struct ModbusChannel<S: DataStore> {
     config: ModbusChannelConfig,
     client: Option<ModbusTcpClient>,
+    #[allow(dead_code)]
     store: Arc<S>,
     state: Arc<std::sync::RwLock<ConnectionState>>,
     diagnostics: Arc<RwLock<ChannelDiagnostics>>,
@@ -120,7 +121,10 @@ impl<S: DataStore> ModbusChannel<S> {
 
     /// Get connection state.
     fn get_state(&self) -> ConnectionState {
-        self.state.read().map(|s| *s).unwrap_or(ConnectionState::Error)
+        self.state
+            .read()
+            .map(|s| *s)
+            .unwrap_or(ConnectionState::Error)
     }
 
     /// Get the point configurations.
@@ -129,10 +133,8 @@ impl<S: DataStore> ModbusChannel<S> {
     }
 
     /// Read a single Modbus address and convert to DataPoint.
-    async fn read_modbus_point(
-        &mut self,
-        point: &PointConfig,
-    ) -> Result<DataPoint> {
+    #[allow(dead_code)]
+    async fn read_modbus_point(&mut self, point: &PointConfig) -> Result<DataPoint> {
         let client = self.client.as_mut().ok_or(GatewayError::NotConnected)?;
 
         let modbus_addr = match &point.address {
@@ -165,7 +167,12 @@ impl<S: DataStore> ModbusChannel<S> {
                     .read_03(modbus_addr.slave_id, modbus_addr.register, count)
                     .await
                     .map_err(|e| GatewayError::Protocol(e.to_string()))?;
-                decode_registers(&regs, modbus_addr.format, modbus_addr.byte_order, modbus_addr.bit_position)?
+                decode_registers(
+                    &regs,
+                    modbus_addr.format,
+                    modbus_addr.byte_order,
+                    modbus_addr.bit_position,
+                )?
             }
             4 => {
                 // Read input registers (FC04)
@@ -174,18 +181,29 @@ impl<S: DataStore> ModbusChannel<S> {
                     .read_04(modbus_addr.slave_id, modbus_addr.register, count)
                     .await
                     .map_err(|e| GatewayError::Protocol(e.to_string()))?;
-                decode_registers(&regs, modbus_addr.format, modbus_addr.byte_order, modbus_addr.bit_position)?
+                decode_registers(
+                    &regs,
+                    modbus_addr.format,
+                    modbus_addr.byte_order,
+                    modbus_addr.bit_position,
+                )?
             }
-            _ => return Err(GatewayError::Unsupported(format!(
-                "Function code {} not supported for read",
-                modbus_addr.function_code
-            ))),
+            _ => {
+                return Err(GatewayError::Unsupported(format!(
+                    "Function code {} not supported for read",
+                    modbus_addr.function_code
+                )))
+            }
         };
 
         // Apply transform
         let transformed_value = apply_transform(value, &point.transform);
 
-        Ok(DataPoint::new(&point.id, point.data_type, transformed_value))
+        Ok(DataPoint::new(
+            &point.id,
+            point.data_type,
+            transformed_value,
+        ))
     }
 
     /// Record an error in diagnostics.

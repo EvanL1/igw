@@ -213,7 +213,10 @@ impl<S: DataStore> Iec104Channel<S> {
 
     /// Get connection state.
     fn get_state(&self) -> ConnectionState {
-        self.state.read().map(|s| *s).unwrap_or(ConnectionState::Error)
+        self.state
+            .read()
+            .map(|s| *s)
+            .unwrap_or(ConnectionState::Error)
     }
 
     /// Start data transfer (STARTDT).
@@ -283,11 +286,17 @@ impl<S: DataStore> Iec104Channel<S> {
         match event {
             Iec104Event::Connected => {
                 self.set_state(ConnectionState::Connected);
-                let _ = self.event_tx.send(DataEvent::ConnectionChanged(ConnectionState::Connected)).await;
+                let _ = self
+                    .event_tx
+                    .send(DataEvent::ConnectionChanged(ConnectionState::Connected))
+                    .await;
             }
             Iec104Event::Disconnected => {
                 self.set_state(ConnectionState::Disconnected);
-                let _ = self.event_tx.send(DataEvent::ConnectionChanged(ConnectionState::Disconnected)).await;
+                let _ = self
+                    .event_tx
+                    .send(DataEvent::ConnectionChanged(ConnectionState::Disconnected))
+                    .await;
             }
             Iec104Event::DataTransferStarted => {
                 // Data transfer is active
@@ -756,6 +765,9 @@ mod tests {
         };
 
         let dt = cp56time2a_to_datetime(&time).unwrap();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-12-25 10:15:30");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2024-12-25 10:15:30"
+        );
     }
 }

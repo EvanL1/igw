@@ -4,3 +4,6 @@
 [submodule "deps/voltage-iec104"]
 	path = deps/voltage-iec104
 	url = https://github.com/EvanL1/voltage-iec104.git
+[submodule "deps/voltage-j1939"]
+	path = deps/voltage-j1939
+	url = https://github.com/EvanL1/voltage-j1939.git

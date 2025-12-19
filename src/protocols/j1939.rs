@@ -4,13 +4,19 @@
 //! This implementation supports:
 //! - Passive listening for broadcast PGNs
 //! - Active request for on-demand PGNs (Request PGN 0xEA00)
-//! - Complete built-in SPN database (88 SPNs, 16 PGNs)
+//! - Complete built-in SPN database (60+ SPNs, 12+ PGNs)
 //!
 //! ## Features
 //!
 //! - **Event-Driven**: Passively listens to CAN bus, decodes all known PGNs automatically
-//! - **SPN Database**: 88 pre-defined SPNs covering engine/generator parameters
+//! - **SPN Database**: Pre-defined SPNs covering engine/generator parameters
 //! - **Point ID = SPN**: Uses globally unique SPN numbers as point identifiers
+//!
+//! ## Dependencies
+//!
+//! This module uses:
+//! - [`voltage_j1939`](https://crates.io/crates/voltage_j1939) for J1939 protocol parsing
+//! - [`socketcan`](https://crates.io/crates/socketcan) for CAN bus communication (Linux only)
 //!
 //! ## Example
 //!
@@ -38,8 +44,13 @@
 //! }
 //! ```
 
-mod database;
 mod client;
 
-pub use database::{SpnDataType, SpnDef, SPN_DEFINITIONS, get_spn_def, get_spns_for_pgn, database_stats};
+// Re-export client
 pub use client::{J1939Client, J1939Config};
+
+// Re-export voltage_j1939 types for convenience
+pub use voltage_j1939::{
+    database_stats, decode_frame, decode_spn, get_spn_def, get_spns_for_pgn, list_supported_pgns,
+    parse_can_id, DecodedSpn, J1939Id, SpnDataType, SpnDef,
+};

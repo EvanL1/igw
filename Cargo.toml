@@ -16,7 +16,7 @@ default = []
 # Protocol support
 modbus = ["dep:voltage_modbus"]
 iec104 = ["dep:voltage_iec104"]
-j1939 = ["dep:socketcan"]
+j1939 = ["dep:socketcan", "dep:voltage_j1939"]
 opcua = ["dep:async-opcua"]
 
 # Virtual channel (no external deps)
@@ -73,6 +73,7 @@ async-opcua = { version = "0.14", default-features = false, features = ["client"
 # Optional: J1939/CAN protocol support (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
 socketcan = { version = "3.3", optional = true }
+voltage_j1939 = { version = "0.1", path = "deps/voltage-j1939", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -37,31 +37,30 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-pub mod core;
 pub mod codec;
-pub mod store;
-pub mod router;
+pub mod core;
 pub mod protocols;
+pub mod router;
+pub mod store;
 
 /// Prelude module for convenient imports
 pub mod prelude {
     pub use crate::core::{
-        traits::*,
         data::*,
+        error::{GatewayError, Result},
         point::*,
         quality::*,
-        error::{GatewayError, Result},
+        traits::*,
     };
     pub use crate::store::{DataStore, MemoryStore};
 }
 
 // Re-export core types at crate root for convenience
+pub use crate::core::data::{DataBatch, DataPoint, DataType, Value};
 pub use crate::core::error::{GatewayError, Result};
-pub use crate::core::data::{Value, DataType, DataPoint, DataBatch};
 pub use crate::core::quality::Quality;
 pub use crate::core::traits::{
-    Protocol, ProtocolClient, ProtocolCapabilities,
-    CommunicationMode, ConnectionState,
+    CommunicationMode, ConnectionState, Protocol, ProtocolCapabilities, ProtocolClient,
 };
 
 // Re-export store types

@@ -2,14 +2,14 @@
 //!
 //! This module provides the foundational types and traits that all protocols implement.
 
-pub mod traits;
 pub mod data;
+pub mod error;
 pub mod point;
 pub mod quality;
-pub mod error;
+pub mod traits;
 
-pub use traits::*;
 pub use data::*;
+pub use error::{GatewayError, Result};
 pub use point::*;
 pub use quality::*;
-pub use error::{GatewayError, Result};
+pub use traits::*;

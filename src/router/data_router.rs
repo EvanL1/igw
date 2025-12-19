@@ -211,7 +211,10 @@ impl<S: DataStore + 'static> DataRouter<S> {
         point: &DataPoint,
         state: &Arc<RwLock<RouterState>>,
     ) -> bool {
-        let trigger = mapping.trigger.as_ref().unwrap_or(&TriggerCondition::Always);
+        let trigger = mapping
+            .trigger
+            .as_ref()
+            .unwrap_or(&TriggerCondition::Always);
 
         match trigger {
             TriggerCondition::Always => true,
@@ -291,7 +294,10 @@ impl<S: DataStore + 'static> DataRouter<S> {
         let mut target_batches: HashMap<u32, DataBatch> = HashMap::new();
 
         for point in batch.iter() {
-            let mappings = self.config.routing_table.find_by_source(source_channel, &point.id);
+            let mappings = self
+                .config
+                .routing_table
+                .find_by_source(source_channel, &point.id);
 
             for mapping in mappings {
                 if !Self::should_forward(mapping, point, &self.state).await {

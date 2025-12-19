@@ -56,11 +56,7 @@ impl PointMapping {
     }
 
     /// Create a mapping with same point ID on both ends.
-    pub fn same_id(
-        source_channel: u32,
-        point_id: impl Into<String>,
-        target_channel: u32,
-    ) -> Self {
+    pub fn same_id(source_channel: u32, point_id: impl Into<String>, target_channel: u32) -> Self {
         let id = point_id.into();
         Self {
             source_channel,
@@ -161,9 +157,7 @@ impl RoutingTable {
     pub fn find_by_source(&self, channel_id: u32, point_id: &str) -> Vec<&PointMapping> {
         self.mappings
             .iter()
-            .filter(|m| {
-                m.enabled && m.source_channel == channel_id && m.source_point == point_id
-            })
+            .filter(|m| m.enabled && m.source_channel == channel_id && m.source_point == point_id)
             .collect()
     }
 

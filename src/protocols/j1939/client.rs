@@ -7,21 +7,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use socketcan::{CanFrame, CanSocket, EmbeddedFrame, ExtendedId, Frame, Socket};
+use socketcan::{CanSocket, EmbeddedFrame, Frame, Socket};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
+use voltage_j1939::{database_stats, decode_frame, extract_pgn, extract_source_address};
 
 use crate::core::data::{DataBatch, DataPoint, DataType, Value};
 use crate::core::error::{GatewayError, Result};
 use crate::core::quality::Quality;
 use crate::core::traits::{
-    CommunicationMode, ConnectionState, ControlCommand, AdjustmentCommand,
-    DataEvent, DataEventHandler, DataEventReceiver, DataEventSender,
-    Diagnostics, EventDrivenProtocol, PollingConfig, Protocol, ProtocolCapabilities,
-    ProtocolClient, ReadRequest, ReadResponse, WriteResult,
+    AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
+    DataEventHandler, DataEventReceiver, DataEventSender, Diagnostics, EventDrivenProtocol,
+    PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
+    WriteResult,
 };
-
-use super::database::{SpnDataType, SpnDef, SPN_DEFINITIONS, database_stats};
 
 // ============================================================================
 // Configuration
@@ -55,53 +54,15 @@ impl Default for J1939Config {
 }
 
 // ============================================================================
-// Internal types
-// ============================================================================
-
-/// Runtime point configuration (point_id = SPN)
-#[derive(Debug, Clone)]
-struct J1939Point {
-    point_id: u32,
-    name: String,
-    spn: u32,
-    pgn: u32,
-    start_byte: u8,
-    start_bit: u8,
-    bit_length: u8,
-    scale: f64,
-    offset: f64,
-    data_type: SpnDataType,
-}
-
-impl From<&SpnDef> for J1939Point {
-    fn from(spn: &SpnDef) -> Self {
-        Self {
-            point_id: spn.spn,
-            name: spn.name.to_string(),
-            spn: spn.spn,
-            pgn: spn.pgn,
-            start_byte: spn.start_byte,
-            start_bit: spn.start_bit,
-            bit_length: spn.bit_length,
-            scale: spn.scale,
-            offset: spn.offset,
-            data_type: spn.data_type,
-        }
-    }
-}
-
-// ============================================================================
 // J1939Client
 // ============================================================================
 
 /// J1939 protocol client.
 ///
 /// Implements event-driven communication over CAN bus using the SAE J1939 protocol.
+/// Uses `voltage_j1939` crate for protocol parsing and SPN database.
 pub struct J1939Client {
     config: J1939Config,
-
-    // Point mappings by PGN
-    pgn_points: HashMap<u32, Vec<J1939Point>>,
 
     // Connection state
     connection_state: Arc<RwLock<ConnectionState>>,
@@ -126,18 +87,8 @@ pub struct J1939Client {
 impl J1939Client {
     /// Create a new J1939 client with the given configuration.
     pub fn new(config: J1939Config) -> Self {
-        // Build point mappings from SPN database
-        let mut pgn_points: HashMap<u32, Vec<J1939Point>> = HashMap::new();
-        for spn_def in SPN_DEFINITIONS {
-            pgn_points
-                .entry(spn_def.pgn)
-                .or_default()
-                .push(J1939Point::from(spn_def));
-        }
-
         Self {
             config,
-            pgn_points,
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             is_connected: Arc::new(AtomicBool::new(false)),
             read_count: AtomicU64::new(0),
@@ -150,91 +101,11 @@ impl J1939Client {
         }
     }
 
-    /// Parse J1939 CAN ID (29-bit extended frame).
-    fn parse_can_id(can_id: u32) -> (u8, u32, u8, u8) {
-        let sa = (can_id & 0xFF) as u8;
-        let ps = ((can_id >> 8) & 0xFF) as u8;
-        let pf = ((can_id >> 16) & 0xFF) as u8;
-        let dp = ((can_id >> 24) & 0x01) as u8;
-        let priority = ((can_id >> 26) & 0x07) as u8;
-
-        let pgn = if pf >= 240 {
-            ((dp as u32) << 16) | ((pf as u32) << 8) | (ps as u32)
-        } else {
-            ((dp as u32) << 16) | ((pf as u32) << 8)
-        };
-
-        (priority, pgn, ps, sa)
-    }
-
-    /// Decode SPN value from CAN data.
-    fn decode_spn(data: &[u8], point: &J1939Point) -> Option<f64> {
-        if data.len() <= point.start_byte as usize {
-            return None;
-        }
-
-        let raw_value = match point.data_type {
-            SpnDataType::Uint8 => {
-                if point.bit_length == 8 && point.start_bit == 0 {
-                    data[point.start_byte as usize] as u64
-                } else {
-                    let byte = data[point.start_byte as usize];
-                    let mask = (1u8 << point.bit_length) - 1;
-                    ((byte >> point.start_bit) & mask) as u64
-                }
-            }
-            SpnDataType::Uint16 => {
-                let idx = point.start_byte as usize;
-                if idx + 1 >= data.len() {
-                    return None;
-                }
-                u16::from_le_bytes([data[idx], data[idx + 1]]) as u64
-            }
-            SpnDataType::Uint32 => {
-                let idx = point.start_byte as usize;
-                if idx + 3 >= data.len() {
-                    return None;
-                }
-                u32::from_le_bytes([data[idx], data[idx + 1], data[idx + 2], data[idx + 3]]) as u64
-            }
-            SpnDataType::Int8 => {
-                let byte = data[point.start_byte as usize] as i8;
-                byte as i64 as u64
-            }
-            SpnDataType::Int16 => {
-                let idx = point.start_byte as usize;
-                if idx + 1 >= data.len() {
-                    return None;
-                }
-                let val = i16::from_le_bytes([data[idx], data[idx + 1]]);
-                val as i64 as u64
-            }
-            SpnDataType::Int32 => {
-                let idx = point.start_byte as usize;
-                if idx + 3 >= data.len() {
-                    return None;
-                }
-                let val = i32::from_le_bytes([data[idx], data[idx + 1], data[idx + 2], data[idx + 3]]);
-                val as i64 as u64
-            }
-        };
-
-        // Check for "not available" values
-        let max_value = (1u64 << point.bit_length) - 1;
-        if raw_value >= max_value - 1 {
-            return None;
-        }
-
-        let value = (raw_value as f64) * point.scale + point.offset;
-        Some(value)
-    }
-
     /// Start the receive task.
     fn start_receive_task(&mut self) -> Result<()> {
         let can_interface = self.config.can_interface.clone();
         let source_address = self.config.source_address;
         let is_connected = Arc::clone(&self.is_connected);
-        let pgn_points = self.pgn_points.clone();
         let cached_data = Arc::clone(&self.cached_data);
         let read_count = self.read_count.clone();
         let error_count = self.error_count.clone();
@@ -261,48 +132,51 @@ impl J1939Client {
                     Ok(frame) => {
                         if let Some(id) = frame.id().as_extended() {
                             let can_id = id.as_raw();
-                            let (_, pgn, _, sa) = Self::parse_can_id(can_id);
+                            let sa = extract_source_address(can_id);
 
+                            // Filter by source address
                             if sa != source_address {
                                 continue;
                             }
 
-                            if let Some(points) = pgn_points.get(&pgn) {
-                                let timestamp = chrono::Utc::now();
-                                let mut batch = DataBatch::new();
+                            // Use voltage_j1939 to decode the frame
+                            let decoded_spns = decode_frame(can_id, frame.data());
+                            if decoded_spns.is_empty() {
+                                continue;
+                            }
 
-                                for point in points {
-                                    if let Some(value) = Self::decode_spn(frame.data(), point) {
-                                        let data_point = DataPoint {
-                                            id: point.spn.to_string(),
-                                            data_type: DataType::Telemetry,
-                                            value: Value::Float(value),
-                                            quality: Quality::Good,
-                                            timestamp,
-                                        };
+                            let timestamp = chrono::Utc::now();
+                            let mut batch = DataBatch::new();
 
-                                        batch.push(data_point.clone());
+                            for decoded in decoded_spns {
+                                let data_point = DataPoint {
+                                    id: decoded.spn.to_string(),
+                                    data_type: DataType::Telemetry,
+                                    value: Value::Float(decoded.value),
+                                    quality: Quality::Good,
+                                    timestamp,
+                                };
 
-                                        // Update cache
-                                        cached_data.write().await.insert(
-                                            point.spn.to_string(),
-                                            data_point,
-                                        );
-                                    }
+                                batch.push(data_point.clone());
+
+                                // Update cache
+                                cached_data
+                                    .write()
+                                    .await
+                                    .insert(decoded.spn.to_string(), data_point);
+                            }
+
+                            if !batch.is_empty() {
+                                read_count.fetch_add(1, Ordering::Relaxed);
+
+                                // Send event
+                                if let Some(ref sender) = event_sender {
+                                    let _ = sender.send(DataEvent::DataUpdate(batch.clone())).await;
                                 }
 
-                                if !batch.is_empty() {
-                                    read_count.fetch_add(1, Ordering::Relaxed);
-
-                                    // Send event
-                                    if let Some(ref sender) = event_sender {
-                                        let _ = sender.send(DataEvent::DataUpdate(batch.clone())).await;
-                                    }
-
-                                    // Call handler
-                                    if let Some(ref handler) = event_handler {
-                                        handler.on_data_update(batch).await;
-                                    }
+                                // Call handler
+                                if let Some(ref handler) = event_handler {
+                                    handler.on_data_update(batch).await;
                                 }
                             }
                         }
@@ -395,7 +269,7 @@ impl Protocol for J1939Client {
     }
 
     async fn diagnostics(&self) -> Result<Diagnostics> {
-        let (pgn_count, spn_count) = database_stats();
+        let (spn_count, pgn_count) = database_stats();
 
         Ok(Diagnostics {
             protocol: "J1939".to_string(),
@@ -407,8 +281,8 @@ impl Protocol for J1939Client {
             extra: serde_json::json!({
                 "can_interface": self.config.can_interface,
                 "source_address": format!("0x{:02X}", self.config.source_address),
-                "pgn_count": pgn_count,
                 "spn_count": spn_count,
+                "pgn_count": pgn_count,
             }),
         })
     }
@@ -435,10 +309,14 @@ impl ProtocolClient for J1939Client {
 
         // Notify connection change
         if let Some(ref sender) = self.event_sender {
-            let _ = sender.send(DataEvent::ConnectionChanged(ConnectionState::Connected)).await;
+            let _ = sender
+                .send(DataEvent::ConnectionChanged(ConnectionState::Connected))
+                .await;
         }
         if let Some(ref handler) = self.event_handler {
-            handler.on_connection_changed(ConnectionState::Connected).await;
+            handler
+                .on_connection_changed(ConnectionState::Connected)
+                .await;
         }
 
         Ok(())
@@ -455,10 +333,14 @@ impl ProtocolClient for J1939Client {
 
         // Notify connection change
         if let Some(ref sender) = self.event_sender {
-            let _ = sender.send(DataEvent::ConnectionChanged(ConnectionState::Disconnected)).await;
+            let _ = sender
+                .send(DataEvent::ConnectionChanged(ConnectionState::Disconnected))
+                .await;
         }
         if let Some(ref handler) = self.event_handler {
-            handler.on_connection_changed(ConnectionState::Disconnected).await;
+            handler
+                .on_connection_changed(ConnectionState::Disconnected)
+                .await;
         }
 
         Ok(())
@@ -471,7 +353,10 @@ impl ProtocolClient for J1939Client {
         ))
     }
 
-    async fn write_adjustment(&mut self, _adjustments: &[AdjustmentCommand]) -> Result<WriteResult> {
+    async fn write_adjustment(
+        &mut self,
+        _adjustments: &[AdjustmentCommand],
+    ) -> Result<WriteResult> {
         // J1939 adjustment requires proprietary PGN support
         Err(GatewayError::NotSupported(
             "J1939 adjustment commands require proprietary PGN implementation".to_string(),
@@ -493,7 +378,7 @@ impl EventDrivenProtocol for J1939Client {
     fn subscribe(&self) -> DataEventReceiver {
         // This is a simplified implementation
         // In a real implementation, you'd want to support multiple subscribers
-        let (tx, rx) = mpsc::channel(100);
+        let (_tx, rx) = mpsc::channel(100);
         // Note: This overwrites any existing sender, which is not ideal
         // A proper implementation would use a broadcast channel
         rx
@@ -511,41 +396,35 @@ impl EventDrivenProtocol for J1939Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use voltage_j1939::{extract_pgn, parse_can_id};
 
     #[test]
     fn test_parse_can_id() {
         // EEC1 from SA=0x00: CAN ID = 0x0CF00400
-        let (priority, pgn, _ps, sa) = J1939Client::parse_can_id(0x0CF00400);
-        assert_eq!(priority, 3);
-        assert_eq!(pgn, 61444);
-        assert_eq!(sa, 0x00);
+        let id = parse_can_id(0x0CF00400);
+        assert_eq!(id.priority, 3);
+        assert_eq!(id.pgn, 61444);
+        assert_eq!(id.source_address, 0x00);
 
         // ET1 from SA=0x00: CAN ID = 0x18FEEE00
-        let (priority, pgn, _ps, sa) = J1939Client::parse_can_id(0x18FEEE00);
-        assert_eq!(priority, 6);
-        assert_eq!(pgn, 65262);
-        assert_eq!(sa, 0x00);
+        let id = parse_can_id(0x18FEEE00);
+        assert_eq!(id.priority, 6);
+        assert_eq!(id.pgn, 65262);
+        assert_eq!(id.source_address, 0x00);
     }
 
     #[test]
-    fn test_decode_spn() {
-        let point = J1939Point {
-            point_id: 110,
-            name: "coolant_temp".to_string(),
-            spn: 110,
-            pgn: 65262,
-            start_byte: 0,
-            start_bit: 0,
-            bit_length: 8,
-            scale: 1.0,
-            offset: -40.0,
-            data_type: SpnDataType::Uint8,
-        };
+    fn test_decode_frame() {
+        // EEC1 frame
+        let can_id = 0x0CF00400;
+        let data = [0x00, 0x00, 0x00, 0x20, 0x4E, 0x00, 0x00, 0x00];
+        let decoded = decode_frame(can_id, &data);
+        assert!(!decoded.is_empty());
 
-        // Coolant temp = 90°C, raw value = 130 (90 + 40)
-        let data = [130u8, 0, 0, 0, 0, 0, 0, 0];
-        let value = J1939Client::decode_spn(&data, &point);
-        assert_eq!(value, Some(90.0));
+        // Find engine speed (SPN 190)
+        let engine_speed = decoded.iter().find(|d| d.spn == 190);
+        assert!(engine_speed.is_some());
+        assert_eq!(engine_speed.unwrap().value, 2500.0);
     }
 
     #[test]

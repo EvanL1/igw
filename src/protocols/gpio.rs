@@ -78,11 +78,7 @@ pub struct GpioPinConfig {
 
 impl GpioPinConfig {
     /// Create a digital input configuration.
-    pub fn digital_input(
-        chip: impl Into<String>,
-        pin: u32,
-        point_id: impl Into<String>,
-    ) -> Self {
+    pub fn digital_input(chip: impl Into<String>, pin: u32, point_id: impl Into<String>) -> Self {
         Self {
             chip: chip.into(),
             pin,
@@ -94,11 +90,7 @@ impl GpioPinConfig {
     }
 
     /// Create a digital output configuration.
-    pub fn digital_output(
-        chip: impl Into<String>,
-        pin: u32,
-        point_id: impl Into<String>,
-    ) -> Self {
+    pub fn digital_output(chip: impl Into<String>, pin: u32, point_id: impl Into<String>) -> Self {
         Self {
             chip: chip.into(),
             pin,
@@ -445,11 +437,7 @@ impl<S: DataStore + 'static> ProtocolClient for GpioChannel<S> {
                 ticker.tick().await;
 
                 // Check if still connected
-                if !state
-                    .read()
-                    .map(|s| s.is_connected())
-                    .unwrap_or(false)
-                {
+                if !state.read().map(|s| s.is_connected()).unwrap_or(false) {
                     break;
                 }
 
@@ -504,8 +492,8 @@ mod tests {
     #[tokio::test]
     async fn test_gpio_write_control() {
         let store = Arc::new(MemoryStore::new());
-        let config = GpioChannelConfig::new()
-            .add_pin(GpioPinConfig::digital_output("gpiochip0", 18, "led"));
+        let config =
+            GpioChannelConfig::new().add_pin(GpioPinConfig::digital_output("gpiochip0", 18, "led"));
 
         let mut gpio = GpioChannel::new(config, store, 1);
         gpio.connect().await.unwrap();

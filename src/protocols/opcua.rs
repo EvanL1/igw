@@ -41,8 +41,8 @@ use opcua::client::{ClientBuilder, DataChangeCallback, IdentityToken, MonitoredI
 use opcua::crypto::SecurityPolicy;
 use opcua::types::{
     AttributeId, DataValue, Identifier, MessageSecurityMode, MonitoredItemCreateRequest, NodeId,
-    QualifiedName, ReadValueId, StatusCode, TimestampsToReturn, UAString, UserTokenPolicy,
-    Variant, WriteValue,
+    QualifiedName, ReadValueId, StatusCode, TimestampsToReturn, UAString, UserTokenPolicy, Variant,
+    WriteValue,
 };
 use tokio::sync::{mpsc, RwLock};
 
@@ -78,6 +78,7 @@ pub enum OpcUaSecurityPolicy {
 
 impl OpcUaSecurityPolicy {
     /// Convert to opcua SecurityPolicy.
+    #[allow(dead_code)]
     fn to_security_policy(self) -> SecurityPolicy {
         match self {
             Self::None => SecurityPolicy::None,
@@ -90,7 +91,7 @@ impl OpcUaSecurityPolicy {
     }
 
     /// Get the security policy URI string.
-    fn to_uri(&self) -> &'static str {
+    fn to_uri(self) -> &'static str {
         match self {
             Self::None => SecurityPolicy::None.to_uri(),
             Self::Basic128Rsa15 => SecurityPolicy::Basic128Rsa15.to_uri(),
@@ -483,10 +484,14 @@ impl<S: DataStore + 'static> OpcUaChannel<S> {
 
     /// Get connection state.
     fn get_state(&self) -> ConnectionState {
-        self.state.read().map(|s| *s).unwrap_or(ConnectionState::Error)
+        self.state
+            .read()
+            .map(|s| *s)
+            .unwrap_or(ConnectionState::Error)
     }
 
     /// Record an error.
+    #[allow(dead_code)]
     async fn record_error(&self, error: &str) {
         let mut diag = self.diagnostics.write().await;
         diag.error_count += 1;
@@ -500,10 +505,7 @@ impl<S: DataStore + 'static> OpcUaChannel<S> {
 
     /// Create subscription and add monitored items.
     pub async fn create_subscription(&mut self) -> Result<u32> {
-        let session = self
-            .session
-            .as_ref()
-            .ok_or_else(|| GatewayError::NotConnected)?;
+        let session = self.session.as_ref().ok_or(GatewayError::NotConnected)?;
 
         let sub_config = &self.config.subscription;
 
@@ -565,10 +567,7 @@ impl<S: DataStore + 'static> OpcUaChannel<S> {
 
     /// Add monitored items to the subscription.
     pub async fn add_monitored_items(&mut self) -> Result<usize> {
-        let session = self
-            .session
-            .as_ref()
-            .ok_or_else(|| GatewayError::NotConnected)?;
+        let session = self.session.as_ref().ok_or(GatewayError::NotConnected)?;
 
         let subscription_id = self
             .subscription_id
@@ -614,10 +613,7 @@ impl<S: DataStore + 'static> OpcUaChannel<S> {
 
     /// Read node values directly.
     async fn read_nodes(&self, node_ids: &[NodeId]) -> Result<Vec<DataValue>> {
-        let session = self
-            .session
-            .as_ref()
-            .ok_or_else(|| GatewayError::NotConnected)?;
+        let session = self.session.as_ref().ok_or(GatewayError::NotConnected)?;
 
         let read_value_ids: Vec<ReadValueId> = node_ids
             .iter()
@@ -637,10 +633,7 @@ impl<S: DataStore + 'static> OpcUaChannel<S> {
 
     /// Write node values.
     async fn write_nodes(&self, write_values: Vec<WriteValue>) -> Result<Vec<StatusCode>> {
-        let session = self
-            .session
-            .as_ref()
-            .ok_or_else(|| GatewayError::NotConnected)?;
+        let session = self.session.as_ref().ok_or(GatewayError::NotConnected)?;
 
         session
             .write(&write_values)
@@ -1034,12 +1027,12 @@ fn parse_node_id(identifier: &str, namespace_index: u16) -> NodeId {
     // - "s=Temperature" -> String identifier
     // - Just a string -> String identifier
 
-    if identifier.starts_with("i=") {
-        if let Ok(id) = identifier[2..].parse::<u32>() {
+    if let Some(id_str) = identifier.strip_prefix("i=") {
+        if let Ok(id) = id_str.parse::<u32>() {
             return NodeId::new(namespace_index, id);
         }
-    } else if identifier.starts_with("s=") {
-        return NodeId::new(namespace_index, identifier[2..].to_string());
+    } else if let Some(s_str) = identifier.strip_prefix("s=") {
+        return NodeId::new(namespace_index, s_str.to_string());
     }
 
     // Default to string identifier
@@ -1131,7 +1124,10 @@ fn convert_data_value_with_id(
 
     // Get timestamp
     let timestamp = Utc::now();
-    let source_timestamp = dv.source_timestamp.as_ref().and_then(opcua_datetime_to_chrono);
+    let source_timestamp = dv
+        .source_timestamp
+        .as_ref()
+        .and_then(opcua_datetime_to_chrono);
 
     // Determine data type
     let data_type = config.map(|c| c.data_type).unwrap_or_else(|| {

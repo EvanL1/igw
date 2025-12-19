@@ -20,8 +20,8 @@
 //! router.start().await?;
 //! ```
 
-mod mapping;
 mod data_router;
+mod mapping;
 
-pub use mapping::{PointMapping, RoutingTable, TriggerCondition};
 pub use data_router::{DataRouter, RouterConfig, TargetWriter};
+pub use mapping::{PointMapping, RoutingTable, TriggerCondition};
