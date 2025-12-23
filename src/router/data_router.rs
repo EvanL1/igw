@@ -1,4 +1,7 @@
 //! Data router for point mapping and protocol conversion.
+//!
+//! The router operates independently of storage - it accepts data events
+//! via a receiver channel and forwards to registered target writers.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,7 +13,6 @@ use tokio::sync::RwLock;
 use crate::core::data::{DataBatch, DataPoint, Value};
 use crate::core::error::Result;
 use crate::core::traits::{AdjustmentCommand, ControlCommand, DataEvent, DataEventReceiver};
-use crate::store::DataStore;
 
 use super::mapping::{PointMapping, RoutingTable, TriggerCondition};
 
@@ -66,26 +68,29 @@ impl RouterConfig {
 #[derive(Default)]
 struct RouterState {
     /// Last values for change detection: (channel_id, point_id) -> Value
-    last_values: HashMap<(u32, String), Value>,
+    last_values: HashMap<(u32, u32), Value>,
     /// Last forward time for interval triggers: (channel_id, point_id) -> Instant
-    last_forward: HashMap<(u32, String), Instant>,
+    last_forward: HashMap<(u32, u32), Instant>,
 }
 
 /// Data router for forwarding data between channels.
-pub struct DataRouter<S: DataStore> {
+///
+/// The router accepts a data event receiver and forwards data to registered
+/// target writers based on routing rules.
+pub struct DataRouter {
     config: RouterConfig,
-    store: Arc<S>,
+    event_rx: Option<DataEventReceiver>,
     targets: Arc<RwLock<HashMap<u32, Arc<dyn TargetWriter>>>>,
     state: Arc<RwLock<RouterState>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl<S: DataStore + 'static> DataRouter<S> {
-    /// Create a new data router.
-    pub fn new(config: RouterConfig, store: Arc<S>) -> Self {
+impl DataRouter {
+    /// Create a new data router with an event receiver.
+    pub fn new(config: RouterConfig, event_rx: DataEventReceiver) -> Self {
         Self {
             config,
-            store,
+            event_rx: Some(event_rx),
             targets: Arc::new(RwLock::new(HashMap::new())),
             state: Arc::new(RwLock::new(RouterState::default())),
             task_handle: None,
@@ -116,7 +121,7 @@ impl<S: DataStore + 'static> DataRouter<S> {
 
     /// Start the routing task.
     pub async fn start(&mut self) -> Result<()> {
-        let rx = self.store.subscribe();
+        let rx = self.event_rx.take().expect("Event receiver already taken");
         let routing_table = self.config.routing_table.clone();
         let continue_on_error = self.config.continue_on_error;
         let targets = self.targets.clone();
@@ -220,7 +225,7 @@ impl<S: DataStore + 'static> DataRouter<S> {
             TriggerCondition::Always => true,
 
             TriggerCondition::OnChange => {
-                let key = (mapping.source_channel, mapping.source_point.clone());
+                let key = (mapping.source_channel, mapping.source_point);
                 let mut state = state.write().await;
                 let changed = state.last_values.get(&key) != Some(&point.value);
                 if changed {
@@ -240,7 +245,7 @@ impl<S: DataStore + 'static> DataRouter<S> {
             }
 
             TriggerCondition::Interval { min_interval_ms } => {
-                let key = (mapping.source_channel, mapping.source_point.clone());
+                let key = (mapping.source_channel, mapping.source_point);
                 let mut state = state.write().await;
                 let now = Instant::now();
 
@@ -254,7 +259,7 @@ impl<S: DataStore + 'static> DataRouter<S> {
             }
 
             TriggerCondition::Deadband { deadband } => {
-                let key = (mapping.source_channel, mapping.source_point.clone());
+                let key = (mapping.source_channel, mapping.source_point);
                 let mut state = state.write().await;
 
                 if let Some(v) = point.value.as_f64() {
@@ -280,7 +285,7 @@ impl<S: DataStore + 'static> DataRouter<S> {
         };
 
         DataPoint {
-            id: mapping.effective_target_point().to_string(),
+            id: mapping.effective_target_point(),
             data_type: point.data_type,
             value: new_value,
             quality: point.quality,
@@ -297,7 +302,7 @@ impl<S: DataStore + 'static> DataRouter<S> {
             let mappings = self
                 .config
                 .routing_table
-                .find_by_source(source_channel, &point.id);
+                .find_by_source(source_channel, point.id);
 
             for mapping in mappings {
                 if !Self::should_forward(mapping, point, &self.state).await {
@@ -327,7 +332,7 @@ impl<S: DataStore + 'static> DataRouter<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemoryStore;
+    use tokio::sync::mpsc;
 
     struct MockWriter {
         received: Arc<RwLock<Vec<DataBatch>>>,
@@ -359,18 +364,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_route_batch() {
-        let store = Arc::new(MemoryStore::new());
+        let (_tx, rx) = mpsc::channel(16);
         let mut table = RoutingTable::new();
-        table.add(PointMapping::direct(1, "temp", 2, "temp_out"));
+        table.add(PointMapping::direct(1, 100, 2, 200));
 
         let config = RouterConfig::new(table);
-        let router = DataRouter::new(config, store);
+        let router = DataRouter::new(config, rx);
 
         let writer = Arc::new(MockWriter::new());
         router.register_target(2, writer.clone()).await;
 
         let mut batch = DataBatch::new();
-        batch.add(DataPoint::telemetry("temp", 25.5));
+        batch.add(DataPoint::telemetry(100, 25.5));
 
         router.route_batch(1, &batch).await.unwrap();
 
@@ -379,6 +384,6 @@ mod tests {
         assert_eq!(received[0].len(), 1);
 
         let point = received[0].iter().next().unwrap();
-        assert_eq!(point.id, "temp_out");
+        assert_eq!(point.id, 200);
     }
 }

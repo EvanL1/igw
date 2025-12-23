@@ -4,24 +4,31 @@
 //! It serves as a data hub for aggregating data from multiple sources
 //! or as an intermediate point for protocol conversion.
 //!
+//! # Architecture (No DataStore Dependency)
+//!
+//! `VirtualChannel` manages its own internal data buffer. Data is pushed
+//! to it via `write()` and can be retrieved via `poll_once()`.
+//!
 //! # Example
 //!
 //! ```rust,ignore
 //! use igw::protocols::virtual_channel::{VirtualChannel, VirtualChannelConfig};
-//! use igw::store::MemoryStore;
-//! use std::sync::Arc;
 //!
-//! let store = Arc::new(MemoryStore::new());
 //! let config = VirtualChannelConfig::new("data_hub");
-//! let mut channel = VirtualChannel::new(config, store, 100);
+//! let mut channel = VirtualChannel::new(config);
 //!
-//! // Write data from any source
-//! channel.write_point(DataPoint::telemetry("temp", 25.5)).await?;
+//! // Push data from any source
+//! channel.write_point(DataPoint::telemetry(1, 25.5)).await?;
+//!
+//! // Get accumulated data (service layer handles storage)
+//! let batch = channel.poll_once().await?;
+//! store.write_batch(channel_id, &batch).await?;
 //! ```
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use tokio::sync::{mpsc, RwLock};
 
 use crate::core::data::{DataBatch, DataPoint};
@@ -33,7 +40,6 @@ use crate::core::traits::{
     PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
     WriteResult,
 };
-use crate::store::DataStore;
 
 /// Virtual channel configuration.
 #[derive(Debug, Clone)]
@@ -91,44 +97,33 @@ struct VirtualDiagnostics {
 /// Virtual channel implementation.
 ///
 /// This channel type:
-/// - Accepts data writes from any source
-/// - Stores data in the associated DataStore
+/// - Accepts data writes from any source via `write()` or `write_point()`
+/// - Stores data internally (no external DataStore dependency)
 /// - Emits events when data is written
-/// - Does not perform any protocol communication
-pub struct VirtualChannel<S: DataStore> {
+/// - Returns accumulated data via `poll_once()`
+pub struct VirtualChannel {
     config: VirtualChannelConfig,
-    store: Arc<S>,
-    channel_id: u32,
+    /// Internal data buffer: point_id -> DataPoint
+    data_buffer: DashMap<u32, DataPoint>,
     diagnostics: Arc<RwLock<VirtualDiagnostics>>,
     event_tx: DataEventSender,
     _event_rx: Option<DataEventReceiver>,
     event_handler: Option<Arc<dyn DataEventHandler>>,
 }
 
-impl<S: DataStore> VirtualChannel<S> {
+impl VirtualChannel {
     /// Create a new virtual channel.
-    pub fn new(config: VirtualChannelConfig, store: Arc<S>, channel_id: u32) -> Self {
+    pub fn new(config: VirtualChannelConfig) -> Self {
         let (event_tx, event_rx) = mpsc::channel(config.buffer_size);
-
-        // Set point configs in store
-        if !config.points.is_empty() {
-            store.set_point_configs(channel_id, config.points.clone());
-        }
 
         Self {
             config,
-            store,
-            channel_id,
+            data_buffer: DashMap::new(),
             diagnostics: Arc::new(RwLock::new(VirtualDiagnostics::default())),
             event_tx,
             _event_rx: Some(event_rx),
             event_handler: None,
         }
-    }
-
-    /// Get the channel ID.
-    pub fn channel_id(&self) -> u32 {
-        self.channel_id
     }
 
     /// Get the channel name.
@@ -139,9 +134,12 @@ impl<S: DataStore> VirtualChannel<S> {
     /// Write a data batch directly to this channel.
     ///
     /// This is the primary method for feeding data into a virtual channel.
+    /// Data is stored internally and can be retrieved via `poll_once()`.
     pub async fn write(&self, batch: &DataBatch) -> Result<()> {
-        // Store to DataStore
-        self.store.write_batch(self.channel_id, batch).await?;
+        // Store to internal buffer
+        for point in batch.iter() {
+            self.data_buffer.insert(point.id, point.clone());
+        }
 
         // Emit event
         let _ = self
@@ -153,7 +151,7 @@ impl<S: DataStore> VirtualChannel<S> {
         {
             let mut diag = self.diagnostics.write().await;
             diag.write_count += 1;
-            diag.points_stored += batch.len();
+            diag.points_stored = self.data_buffer.len();
         }
 
         // Call event handler if set
@@ -170,9 +168,18 @@ impl<S: DataStore> VirtualChannel<S> {
         batch.add(point);
         self.write(&batch).await
     }
+
+    /// Get all points currently in the buffer.
+    fn get_all_points(&self) -> DataBatch {
+        let mut batch = DataBatch::new();
+        for entry in self.data_buffer.iter() {
+            batch.add(entry.value().clone());
+        }
+        batch
+    }
 }
 
-impl<S: DataStore> ProtocolCapabilities for VirtualChannel<S> {
+impl ProtocolCapabilities for VirtualChannel {
     fn name(&self) -> &'static str {
         "Virtual"
     }
@@ -183,15 +190,15 @@ impl<S: DataStore> ProtocolCapabilities for VirtualChannel<S> {
 }
 
 #[async_trait]
-impl<S: DataStore + 'static> Protocol for VirtualChannel<S> {
+impl Protocol for VirtualChannel {
     fn connection_state(&self) -> ConnectionState {
         // Virtual channels are always "connected"
         ConnectionState::Connected
     }
 
     async fn read(&self, request: ReadRequest) -> Result<ReadResponse> {
-        // Read from store
-        let batch = self.store.read_all(self.channel_id).await?;
+        // Read from internal buffer
+        let batch = self.get_all_points();
 
         // Filter by request if needed
         let filtered = if let Some(ids) = &request.point_ids {
@@ -235,14 +242,13 @@ impl<S: DataStore + 'static> Protocol for VirtualChannel<S> {
             extra: serde_json::json!({
                 "name": self.config.name,
                 "points_stored": diag.points_stored,
-                "channel_id": self.channel_id,
             }),
         })
     }
 }
 
 #[async_trait]
-impl<S: DataStore + 'static> ProtocolClient for VirtualChannel<S> {
+impl ProtocolClient for VirtualChannel {
     async fn connect(&mut self) -> Result<()> {
         // Virtual channel is always connected - no-op
         Ok(())
@@ -253,11 +259,25 @@ impl<S: DataStore + 'static> ProtocolClient for VirtualChannel<S> {
         Ok(())
     }
 
+    /// Poll returns all data currently in the buffer.
+    ///
+    /// For virtual channels, data is pushed (not polled), so this returns
+    /// the accumulated data. The service layer should call this to get
+    /// data that was pushed via `write()`.
+    async fn poll_once(&mut self) -> Result<DataBatch> {
+        let batch = self.get_all_points();
+        {
+            let mut diag = self.diagnostics.write().await;
+            diag.read_count += 1;
+        }
+        Ok(batch)
+    }
+
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
         // For virtual channels, control commands are stored as data points
         let mut batch = DataBatch::new();
         for cmd in commands {
-            batch.add(DataPoint::control(&cmd.id, cmd.value));
+            batch.add(DataPoint::control(cmd.id, cmd.value));
         }
         self.write(&batch).await?;
         Ok(WriteResult::success(commands.len()))
@@ -267,7 +287,7 @@ impl<S: DataStore + 'static> ProtocolClient for VirtualChannel<S> {
         // For virtual channels, adjustments are stored as data points
         let mut batch = DataBatch::new();
         for adj in adjustments {
-            batch.add(DataPoint::adjustment(&adj.id, adj.value));
+            batch.add(DataPoint::adjustment(adj.id, adj.value));
         }
         self.write(&batch).await?;
         Ok(WriteResult::success(adjustments.len()))
@@ -283,7 +303,7 @@ impl<S: DataStore + 'static> ProtocolClient for VirtualChannel<S> {
     }
 }
 
-impl<S: DataStore + 'static> EventDrivenProtocol for VirtualChannel<S> {
+impl EventDrivenProtocol for VirtualChannel {
     fn subscribe(&self) -> DataEventReceiver {
         // Create a new channel for each subscriber
         let (tx, rx) = mpsc::channel(self.config.buffer_size);
@@ -301,17 +321,15 @@ impl<S: DataStore + 'static> EventDrivenProtocol for VirtualChannel<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemoryStore;
 
     #[tokio::test]
     async fn test_virtual_channel_write_read() {
-        let store = Arc::new(MemoryStore::new());
         let config = VirtualChannelConfig::new("test_channel");
-        let channel = VirtualChannel::new(config, store, 1);
+        let channel = VirtualChannel::new(config);
 
         // Write a point
         channel
-            .write_point(DataPoint::telemetry("temp", 25.5))
+            .write_point(DataPoint::telemetry(1, 25.5))
             .await
             .unwrap();
 
@@ -320,30 +338,48 @@ mod tests {
         assert_eq!(response.data.len(), 1);
 
         let point = response.data.iter().next().unwrap();
-        assert_eq!(point.id, "temp");
+        assert_eq!(point.id, 1);
     }
 
     #[tokio::test]
     async fn test_virtual_channel_always_connected() {
-        let store = Arc::new(MemoryStore::new());
         let config = VirtualChannelConfig::new("test");
-        let channel = VirtualChannel::new(config, store, 1);
+        let channel = VirtualChannel::new(config);
 
         assert_eq!(channel.connection_state(), ConnectionState::Connected);
     }
 
     #[tokio::test]
-    async fn test_virtual_channel_diagnostics() {
-        let store = Arc::new(MemoryStore::new());
-        let config = VirtualChannelConfig::new("diag_test");
-        let channel = VirtualChannel::new(config, store, 1);
+    async fn test_virtual_channel_poll_once() {
+        let config = VirtualChannelConfig::new("poll_test");
+        let mut channel = VirtualChannel::new(config);
 
+        // Write some data
         channel
-            .write_point(DataPoint::telemetry("x", 1.0))
+            .write_point(DataPoint::telemetry(1, 1.0))
             .await
             .unwrap();
         channel
-            .write_point(DataPoint::telemetry("y", 2.0))
+            .write_point(DataPoint::telemetry(2, 2.0))
+            .await
+            .unwrap();
+
+        // Poll returns accumulated data
+        let batch = channel.poll_once().await.unwrap();
+        assert_eq!(batch.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_virtual_channel_diagnostics() {
+        let config = VirtualChannelConfig::new("diag_test");
+        let channel = VirtualChannel::new(config);
+
+        channel
+            .write_point(DataPoint::telemetry(1, 1.0))
+            .await
+            .unwrap();
+        channel
+            .write_point(DataPoint::telemetry(2, 2.0))
             .await
             .unwrap();
 

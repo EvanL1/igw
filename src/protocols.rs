@@ -4,9 +4,14 @@
 
 pub mod virtual_channel;
 
-#[cfg(feature = "modbus")]
-#[cfg_attr(docsrs, doc(cfg(feature = "modbus")))]
+// modbus-tcp is the base feature; modbus-rtu extends it
+#[cfg(feature = "modbus-tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "modbus-tcp")))]
 pub mod modbus;
+
+#[cfg(feature = "modbus-tcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "modbus-tcp")))]
+pub mod command_batcher;
 
 #[cfg(feature = "iec104")]
 #[cfg_attr(docsrs, doc(cfg(feature = "iec104")))]

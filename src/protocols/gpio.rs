@@ -11,15 +11,12 @@
 //!
 //! ```rust,ignore
 //! use igw::protocols::gpio::{GpioChannel, GpioChannelConfig, GpioPinConfig};
-//! use igw::store::MemoryStore;
-//! use std::sync::Arc;
 //!
-//! let store = Arc::new(MemoryStore::new());
 //! let config = GpioChannelConfig::new()
 //!     .add_pin(GpioPinConfig::digital_input("gpiochip0", 17, "door_sensor"))
 //!     .add_pin(GpioPinConfig::digital_output("gpiochip0", 18, "alarm_led"));
 //!
-//! let mut gpio = GpioChannel::new(config, store, 1);
+//! let mut gpio = GpioChannel::new(config);
 //! gpio.connect().await?;
 //!
 //! // Read DI
@@ -37,13 +34,11 @@ use tokio::sync::RwLock;
 
 use crate::core::data::{DataBatch, DataPoint};
 use crate::core::error::{GatewayError, Result};
-use crate::core::point::PointConfig;
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, Diagnostics,
     PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
     WriteResult,
 };
-use crate::store::DataStore;
 
 /// GPIO pin direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,10 +168,10 @@ struct GpioDiagnostics {
 ///
 /// This is a stub implementation. The actual GPIO operations require
 /// platform-specific libraries (gpiod on Linux).
-pub struct GpioChannel<S: DataStore> {
+///
+/// The service layer (comsrv) is responsible for persistence.
+pub struct GpioChannel {
     config: GpioChannelConfig,
-    store: Arc<S>,
-    channel_id: u32,
     state: Arc<std::sync::RwLock<ConnectionState>>,
     diagnostics: Arc<RwLock<GpioDiagnostics>>,
     poll_task: Option<tokio::task::JoinHandle<()>>,
@@ -184,35 +179,11 @@ pub struct GpioChannel<S: DataStore> {
     output_states: Arc<RwLock<std::collections::HashMap<String, bool>>>,
 }
 
-impl<S: DataStore> GpioChannel<S> {
+impl GpioChannel {
     /// Create a new GPIO channel.
-    pub fn new(config: GpioChannelConfig, store: Arc<S>, channel_id: u32) -> Self {
-        // Build point configs from pin configs
-        let point_configs: Vec<PointConfig> = config
-            .pins
-            .iter()
-            .map(|pin| {
-                let data_type = match pin.direction {
-                    GpioDirection::Input => crate::core::data::DataType::Signal,
-                    GpioDirection::Output => crate::core::data::DataType::Control,
-                };
-                PointConfig::new(
-                    &pin.point_id,
-                    data_type,
-                    crate::core::point::ProtocolAddress::Generic(format!(
-                        "gpio:{}:{}",
-                        pin.chip, pin.pin
-                    )),
-                )
-            })
-            .collect();
-
-        store.set_point_configs(channel_id, point_configs);
-
+    pub fn new(config: GpioChannelConfig) -> Self {
         Self {
             config,
-            store,
-            channel_id,
             state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
             diagnostics: Arc::new(RwLock::new(GpioDiagnostics::default())),
             poll_task: None,
@@ -272,7 +243,7 @@ impl<S: DataStore> GpioChannel<S> {
     }
 }
 
-impl<S: DataStore> ProtocolCapabilities for GpioChannel<S> {
+impl ProtocolCapabilities for GpioChannel {
     fn name(&self) -> &'static str {
         "GPIO"
     }
@@ -283,7 +254,7 @@ impl<S: DataStore> ProtocolCapabilities for GpioChannel<S> {
 }
 
 #[async_trait]
-impl<S: DataStore + 'static> Protocol for GpioChannel<S> {
+impl Protocol for GpioChannel {
     fn connection_state(&self) -> ConnectionState {
         self.get_state()
     }
@@ -332,9 +303,7 @@ impl<S: DataStore + 'static> Protocol for GpioChannel<S> {
             diag.read_count += 1;
         }
 
-        // Store to DataStore
-        self.store.write_batch(self.channel_id, &batch).await?;
-
+        // Return batch directly (service layer handles storage)
         Ok(ReadResponse::success(batch))
     }
 
@@ -353,14 +322,13 @@ impl<S: DataStore + 'static> Protocol for GpioChannel<S> {
             extra: serde_json::json!({
                 "input_pins": input_count,
                 "output_pins": output_count,
-                "channel_id": self.channel_id,
             }),
         })
     }
 }
 
 #[async_trait]
-impl<S: DataStore + 'static> ProtocolClient for GpioChannel<S> {
+impl ProtocolClient for GpioChannel {
     async fn connect(&mut self) -> Result<()> {
         // In a real implementation, validate GPIO chips and pins exist
         self.set_state(ConnectionState::Connected);
@@ -423,38 +391,10 @@ impl<S: DataStore + 'static> ProtocolClient for GpioChannel<S> {
         ))
     }
 
-    async fn start_polling(&mut self, config: PollingConfig) -> Result<()> {
-        let interval = Duration::from_millis(config.interval_ms);
-        let state = self.state.clone();
-        let store = self.store.clone();
-        let channel_id = self.channel_id;
-        let pins: Vec<GpioPinConfig> = self.config.input_pins().cloned().collect();
-
-        let task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-
-            loop {
-                ticker.tick().await;
-
-                // Check if still connected
-                if !state.read().map(|s| s.is_connected()).unwrap_or(false) {
-                    break;
-                }
-
-                // Read all input pins
-                let mut batch = DataBatch::new();
-                for pin in &pins {
-                    // Stub: return false
-                    let value = if pin.active_low { true } else { false };
-                    batch.add(DataPoint::signal(&pin.point_id, value));
-                }
-
-                // Store
-                let _ = store.write_batch(channel_id, &batch).await;
-            }
-        });
-
-        self.poll_task = Some(task);
+    async fn start_polling(&mut self, _config: PollingConfig) -> Result<()> {
+        // Note: Polling is stub implementation.
+        // In production, the service layer (comsrv) handles the polling loop
+        // and is responsible for persisting data from read() calls.
         Ok(())
     }
 
@@ -469,16 +409,14 @@ impl<S: DataStore + 'static> ProtocolClient for GpioChannel<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemoryStore;
 
     #[tokio::test]
     async fn test_gpio_channel_connect() {
-        let store = Arc::new(MemoryStore::new());
         let config = GpioChannelConfig::new()
             .add_pin(GpioPinConfig::digital_input("gpiochip0", 17, "input1"))
             .add_pin(GpioPinConfig::digital_output("gpiochip0", 18, "output1"));
 
-        let mut gpio = GpioChannel::new(config, store, 1);
+        let mut gpio = GpioChannel::new(config);
 
         assert_eq!(gpio.connection_state(), ConnectionState::Disconnected);
 
@@ -491,11 +429,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_gpio_write_control() {
-        let store = Arc::new(MemoryStore::new());
         let config =
             GpioChannelConfig::new().add_pin(GpioPinConfig::digital_output("gpiochip0", 18, "led"));
 
-        let mut gpio = GpioChannel::new(config, store, 1);
+        let mut gpio = GpioChannel::new(config);
         gpio.connect().await.unwrap();
 
         let result = gpio
@@ -513,12 +450,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_gpio_diagnostics() {
-        let store = Arc::new(MemoryStore::new());
         let config = GpioChannelConfig::new()
             .add_pin(GpioPinConfig::digital_input("gpiochip0", 17, "di1"))
             .add_pin(GpioPinConfig::digital_output("gpiochip0", 18, "do1"));
 
-        let gpio = GpioChannel::new(config, store, 1);
+        let gpio = GpioChannel::new(config);
         let diag = gpio.diagnostics().await.unwrap();
 
         assert_eq!(diag.protocol, "GPIO");

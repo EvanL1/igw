@@ -85,7 +85,7 @@ pub struct ReadRequest {
     pub data_type: Option<DataType>,
 
     /// Point IDs to read (None = all points)
-    pub point_ids: Option<Vec<String>>,
+    pub point_ids: Option<Vec<u32>>,
 }
 
 impl ReadRequest {
@@ -98,7 +98,7 @@ impl ReadRequest {
     }
 
     /// Create a request for specific points.
-    pub fn by_ids(ids: Vec<String>) -> Self {
+    pub fn by_ids(ids: Vec<u32>) -> Self {
         Self {
             data_type: None,
             point_ids: Some(ids),
@@ -156,7 +156,7 @@ impl ReadResponse {
 #[derive(Debug, Clone)]
 pub struct ControlCommand {
     /// Point ID
-    pub id: String,
+    pub id: u32,
 
     /// Command value (true = ON/CLOSE, false = OFF/OPEN)
     pub value: bool,
@@ -167,18 +167,18 @@ pub struct ControlCommand {
 
 impl ControlCommand {
     /// Create a latching control command.
-    pub fn latching(id: impl Into<String>, value: bool) -> Self {
+    pub fn latching(id: u32, value: bool) -> Self {
         Self {
-            id: id.into(),
+            id,
             value,
             pulse_duration_ms: None,
         }
     }
 
     /// Create a pulse control command.
-    pub fn pulse(id: impl Into<String>, value: bool, duration_ms: u32) -> Self {
+    pub fn pulse(id: u32, value: bool, duration_ms: u32) -> Self {
         Self {
-            id: id.into(),
+            id,
             value,
             pulse_duration_ms: Some(duration_ms),
         }
@@ -189,7 +189,7 @@ impl ControlCommand {
 #[derive(Debug, Clone)]
 pub struct AdjustmentCommand {
     /// Point ID
-    pub id: String,
+    pub id: u32,
 
     /// Setpoint value
     pub value: f64,
@@ -197,11 +197,8 @@ pub struct AdjustmentCommand {
 
 impl AdjustmentCommand {
     /// Create an adjustment command.
-    pub fn new(id: impl Into<String>, value: f64) -> Self {
-        Self {
-            id: id.into(),
-            value,
-        }
+    pub fn new(id: u32, value: f64) -> Self {
+        Self { id, value }
     }
 }
 
@@ -212,7 +209,7 @@ pub struct WriteResult {
     pub success_count: usize,
 
     /// IDs of failed writes with error messages.
-    pub failures: Vec<(String, String)>,
+    pub failures: Vec<(u32, String)>,
 }
 
 impl WriteResult {
@@ -340,13 +337,27 @@ pub trait ProtocolClient: Protocol {
     /// Disconnect from the target.
     async fn disconnect(&mut self) -> Result<()>;
 
+    /// Execute a single poll cycle and return collected data.
+    ///
+    /// This is the primary method for data acquisition. The caller (service layer)
+    /// is responsible for storing the returned data. The protocol layer only
+    /// handles device communication.
+    ///
+    /// # Returns
+    ///
+    /// A `DataBatch` containing all successfully read points from configured sources.
+    async fn poll_once(&mut self) -> Result<DataBatch>;
+
     /// Write control commands.
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult>;
 
     /// Write adjustment commands.
     async fn write_adjustment(&mut self, adjustments: &[AdjustmentCommand]) -> Result<WriteResult>;
 
-    /// Start polling task.
+    /// Start polling task (legacy, prefer using poll_once() with external loop).
+    ///
+    /// This method is kept for backward compatibility. New implementations
+    /// should use `poll_once()` with an external polling loop managed by the service layer.
     async fn start_polling(&mut self, config: PollingConfig) -> Result<()>;
 
     /// Stop polling task.
@@ -438,10 +449,10 @@ mod tests {
 
     #[test]
     fn test_control_command() {
-        let cmd = ControlCommand::latching("valve1", true);
+        let cmd = ControlCommand::latching(1, true);
         assert!(cmd.pulse_duration_ms.is_none());
 
-        let cmd = ControlCommand::pulse("valve1", true, 500);
+        let cmd = ControlCommand::pulse(1, true, 500);
         assert_eq!(cmd.pulse_duration_ms, Some(500));
     }
 }

@@ -11,13 +11,13 @@ pub struct PointMapping {
     pub source_channel: u32,
 
     /// Source point ID.
-    pub source_point: String,
+    pub source_point: u32,
 
     /// Target channel ID.
     pub target_channel: u32,
 
     /// Target point ID (defaults to same as source if None).
-    pub target_point: Option<String>,
+    pub target_point: Option<u32>,
 
     /// Data transformation to apply.
     #[serde(default)]
@@ -40,15 +40,15 @@ impl PointMapping {
     /// Create a simple 1:1 mapping.
     pub fn direct(
         source_channel: u32,
-        source_point: impl Into<String>,
+        source_point: u32,
         target_channel: u32,
-        target_point: impl Into<String>,
+        target_point: u32,
     ) -> Self {
         Self {
             source_channel,
-            source_point: source_point.into(),
+            source_point,
             target_channel,
-            target_point: Some(target_point.into()),
+            target_point: Some(target_point),
             transform: TransformConfig::default(),
             enabled: true,
             trigger: None,
@@ -56,13 +56,12 @@ impl PointMapping {
     }
 
     /// Create a mapping with same point ID on both ends.
-    pub fn same_id(source_channel: u32, point_id: impl Into<String>, target_channel: u32) -> Self {
-        let id = point_id.into();
+    pub fn same_id(source_channel: u32, point_id: u32, target_channel: u32) -> Self {
         Self {
             source_channel,
-            source_point: id.clone(),
+            source_point: point_id,
             target_channel,
-            target_point: Some(id),
+            target_point: Some(point_id),
             transform: TransformConfig::default(),
             enabled: true,
             trigger: None,
@@ -88,8 +87,8 @@ impl PointMapping {
     }
 
     /// Get effective target point ID.
-    pub fn effective_target_point(&self) -> &str {
-        self.target_point.as_deref().unwrap_or(&self.source_point)
+    pub fn effective_target_point(&self) -> u32 {
+        self.target_point.unwrap_or(self.source_point)
     }
 }
 
@@ -154,7 +153,7 @@ impl RoutingTable {
     }
 
     /// Find mappings for a source point.
-    pub fn find_by_source(&self, channel_id: u32, point_id: &str) -> Vec<&PointMapping> {
+    pub fn find_by_source(&self, channel_id: u32, point_id: u32) -> Vec<&PointMapping> {
         self.mappings
             .iter()
             .filter(|m| m.enabled && m.source_channel == channel_id && m.source_point == point_id)
@@ -196,27 +195,27 @@ mod tests {
 
     #[test]
     fn test_point_mapping_direct() {
-        let mapping = PointMapping::direct(1, "temp", 2, "temp_104");
+        let mapping = PointMapping::direct(1, 100, 2, 104);
         assert_eq!(mapping.source_channel, 1);
-        assert_eq!(mapping.source_point, "temp");
+        assert_eq!(mapping.source_point, 100);
         assert_eq!(mapping.target_channel, 2);
-        assert_eq!(mapping.effective_target_point(), "temp_104");
+        assert_eq!(mapping.effective_target_point(), 104);
     }
 
     #[test]
     fn test_point_mapping_same_id() {
-        let mapping = PointMapping::same_id(1, "pressure", 2);
-        assert_eq!(mapping.effective_target_point(), "pressure");
+        let mapping = PointMapping::same_id(1, 200, 2);
+        assert_eq!(mapping.effective_target_point(), 200);
     }
 
     #[test]
     fn test_routing_table() {
         let mut table = RoutingTable::new();
-        table.add(PointMapping::direct(1, "a", 2, "a"));
-        table.add(PointMapping::direct(1, "b", 2, "b"));
-        table.add(PointMapping::direct(1, "a", 3, "a"));
+        table.add(PointMapping::direct(1, 1, 2, 1));
+        table.add(PointMapping::direct(1, 2, 2, 2));
+        table.add(PointMapping::direct(1, 1, 3, 1));
 
-        let mappings = table.find_by_source(1, "a");
+        let mappings = table.find_by_source(1, 1);
         assert_eq!(mappings.len(), 2);
 
         let targets = table.targets_for_channel(2);

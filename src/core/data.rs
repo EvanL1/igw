@@ -219,8 +219,8 @@ impl From<&str> for Value {
 /// A single data point with timestamp and quality.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataPoint {
-    /// Point identifier (protocol-agnostic)
-    pub id: String,
+    /// Point identifier (numeric, application-level ID)
+    pub id: u32,
 
     /// Data type (T/S/C/A)
     pub data_type: DataType,
@@ -242,9 +242,9 @@ pub struct DataPoint {
 
 impl DataPoint {
     /// Create a new data point with current timestamp.
-    pub fn new(id: impl Into<String>, data_type: DataType, value: impl Into<Value>) -> Self {
+    pub fn new(id: u32, data_type: DataType, value: impl Into<Value>) -> Self {
         Self {
-            id: id.into(),
+            id,
             data_type,
             value: value.into(),
             quality: Quality::Good,
@@ -254,22 +254,22 @@ impl DataPoint {
     }
 
     /// Create a telemetry data point.
-    pub fn telemetry(id: impl Into<String>, value: impl Into<Value>) -> Self {
+    pub fn telemetry(id: u32, value: impl Into<Value>) -> Self {
         Self::new(id, DataType::Telemetry, value)
     }
 
     /// Create a signal data point.
-    pub fn signal(id: impl Into<String>, value: bool) -> Self {
+    pub fn signal(id: u32, value: bool) -> Self {
         Self::new(id, DataType::Signal, value)
     }
 
     /// Create a control data point.
-    pub fn control(id: impl Into<String>, value: bool) -> Self {
+    pub fn control(id: u32, value: bool) -> Self {
         Self::new(id, DataType::Control, value)
     }
 
     /// Create an adjustment data point.
-    pub fn adjustment(id: impl Into<String>, value: impl Into<Value>) -> Self {
+    pub fn adjustment(id: u32, value: impl Into<Value>) -> Self {
         Self::new(id, DataType::Adjustment, value)
     }
 
@@ -375,8 +375,8 @@ mod tests {
     #[test]
     fn test_data_batch() {
         let mut batch = DataBatch::new();
-        batch.add(DataPoint::telemetry("temp", 25.5));
-        batch.add(DataPoint::signal("door", true));
+        batch.add(DataPoint::telemetry(1, 25.5));
+        batch.add(DataPoint::signal(2, true));
 
         assert_eq!(batch.len(), 2);
         assert_eq!(batch.telemetry.len(), 1);

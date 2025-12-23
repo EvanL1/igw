@@ -48,7 +48,6 @@ use crate::core::traits::{
     PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
     WriteResult,
 };
-use crate::store::DataStore;
 
 /// IEC 104 channel configuration.
 #[derive(Debug, Clone)]
@@ -81,7 +80,7 @@ pub struct Iec104ChannelConfig {
     pub points: Vec<PointConfig>,
 
     /// IOA to point ID mapping (built from points)
-    ioa_mapping: HashMap<u32, String>,
+    ioa_mapping: HashMap<u32, u32>,
 }
 
 impl Iec104ChannelConfig {
@@ -136,7 +135,7 @@ impl Iec104ChannelConfig {
         // Build IOA mapping from point configs
         for point in &points {
             if let crate::core::point::ProtocolAddress::Iec104(addr) = &point.address {
-                self.ioa_mapping.insert(addr.ioa, point.id.clone());
+                self.ioa_mapping.insert(addr.ioa, point.id);
             }
         }
         self.points = points;
@@ -160,11 +159,12 @@ impl Iec104ChannelConfig {
 ///
 /// This struct wraps a `voltage_iec104::Iec104Client` and implements
 /// igw's `Protocol`, `ProtocolClient`, and `EventDrivenProtocol` traits.
-pub struct Iec104Channel<S: DataStore> {
+///
+/// Note: This adapter follows the "protocol layer separated from storage" design.
+/// The channel returns DataBatch via events; the service layer handles persistence.
+pub struct Iec104Channel {
     config: Iec104ChannelConfig,
     client: Iec104Client,
-    store: Arc<S>,
-    channel_id: u32,
     state: Arc<std::sync::RwLock<ConnectionState>>,
     diagnostics: Arc<RwLock<ChannelDiagnostics>>,
     event_tx: DataEventSender,
@@ -183,9 +183,9 @@ struct ChannelDiagnostics {
     last_interrogation: Option<std::time::Instant>,
 }
 
-impl<S: DataStore> Iec104Channel<S> {
+impl Iec104Channel {
     /// Create a new IEC 104 channel.
-    pub fn new(config: Iec104ChannelConfig, store: Arc<S>, channel_id: u32) -> Self {
+    pub fn new(config: Iec104ChannelConfig) -> Self {
         let client_config = config.to_client_config();
         let client = Iec104Client::new(client_config);
         let (event_tx, event_rx) = mpsc::channel(1024);
@@ -193,8 +193,6 @@ impl<S: DataStore> Iec104Channel<S> {
         Self {
             config,
             client,
-            store,
-            channel_id,
             state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
             diagnostics: Arc::new(RwLock::new(ChannelDiagnostics::default())),
             event_tx,
@@ -307,12 +305,7 @@ impl<S: DataStore> Iec104Channel<S> {
             Iec104Event::DataUpdate(points) => {
                 let batch = self.convert_data_points(points).await;
                 if !batch.is_empty() {
-                    // Store to DataStore
-                    if let Err(e) = self.store.write_batch(self.channel_id, &batch).await {
-                        self.record_error(&e.to_string()).await;
-                    }
-
-                    // Send event
+                    // Send event (service layer handles storage)
                     let _ = self.event_tx.send(DataEvent::DataUpdate(batch)).await;
 
                     // Update diagnostics
@@ -348,11 +341,13 @@ impl<S: DataStore> Iec104Channel<S> {
         let mut batch = DataBatch::new();
 
         for point in points {
-            // Look up point ID from IOA
-            let point_id = match self.config.ioa_mapping.get(&point.ioa) {
-                Some(id) => id.clone(),
-                None => format!("ioa_{}", point.ioa), // Fallback to IOA-based ID
-            };
+            // Look up point ID from IOA, or use IOA directly as fallback
+            let point_id = self
+                .config
+                .ioa_mapping
+                .get(&point.ioa)
+                .copied()
+                .unwrap_or(point.ioa);
 
             // Convert value
             let value = convert_iec104_value(&point.value);
@@ -393,12 +388,12 @@ impl<S: DataStore> Iec104Channel<S> {
     }
 
     /// Find point config by ID.
-    fn find_point(&self, id: &str) -> Option<&PointConfig> {
+    fn find_point(&self, id: u32) -> Option<&PointConfig> {
         self.config.points.iter().find(|p| p.id == id)
     }
 }
 
-impl<S: DataStore> ProtocolCapabilities for Iec104Channel<S> {
+impl ProtocolCapabilities for Iec104Channel {
     fn name(&self) -> &'static str {
         "IEC 60870-5-104"
     }
@@ -413,7 +408,7 @@ impl<S: DataStore> ProtocolCapabilities for Iec104Channel<S> {
 }
 
 #[async_trait]
-impl<S: DataStore + 'static> Protocol for Iec104Channel<S> {
+impl Protocol for Iec104Channel {
     fn connection_state(&self) -> ConnectionState {
         self.get_state()
     }
@@ -448,7 +443,7 @@ impl<S: DataStore + 'static> Protocol for Iec104Channel<S> {
 }
 
 #[async_trait]
-impl<S: DataStore + 'static> ProtocolClient for Iec104Channel<S> {
+impl ProtocolClient for Iec104Channel {
     async fn connect(&mut self) -> Result<()> {
         self.set_state(ConnectionState::Connecting);
 
@@ -484,16 +479,40 @@ impl<S: DataStore + 'static> ProtocolClient for Iec104Channel<S> {
         }
     }
 
+    async fn poll_once(&mut self) -> Result<DataBatch> {
+        // IEC 104 is event-driven, so poll_once fetches any pending events
+        // from the underlying client and converts them to a DataBatch.
+        let event = self.client.poll().await.map_err(|e| {
+            self.diagnostics.blocking_write().error_count += 1;
+            GatewayError::Protocol(e.to_string())
+        })?;
+
+        let mut batch = DataBatch::new();
+        if let Some(voltage_iec104::Iec104Event::DataUpdate(points)) = event {
+            let converted = self.convert_data_points(points).await;
+            for point in converted.iter() {
+                batch.add(point.clone());
+            }
+        }
+
+        if !batch.is_empty() {
+            let mut diag = self.diagnostics.write().await;
+            diag.recv_count += 1;
+        }
+
+        Ok(batch)
+    }
+
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
         let mut success_count = 0;
         let mut failures = Vec::new();
 
         for cmd in commands {
             // Find point config
-            let point = match self.find_point(&cmd.id) {
+            let point = match self.find_point(cmd.id) {
                 Some(p) => p,
                 None => {
-                    failures.push((cmd.id.clone(), "Point not found".into()));
+                    failures.push((cmd.id, "Point not found".into()));
                     continue;
                 }
             };
@@ -502,7 +521,7 @@ impl<S: DataStore + 'static> ProtocolClient for Iec104Channel<S> {
             let iec_addr = match &point.address {
                 crate::core::point::ProtocolAddress::Iec104(addr) => addr,
                 _ => {
-                    failures.push((cmd.id.clone(), "Invalid address type".into()));
+                    failures.push((cmd.id, "Invalid address type".into()));
                     continue;
                 }
             };
@@ -521,7 +540,7 @@ impl<S: DataStore + 'static> ProtocolClient for Iec104Channel<S> {
             match result {
                 Ok(()) => success_count += 1,
                 Err(e) => {
-                    failures.push((cmd.id.clone(), e.to_string()));
+                    failures.push((cmd.id, e.to_string()));
                 }
             }
         }
@@ -543,10 +562,10 @@ impl<S: DataStore + 'static> ProtocolClient for Iec104Channel<S> {
 
         for adj in adjustments {
             // Find point config
-            let point = match self.find_point(&adj.id) {
+            let point = match self.find_point(adj.id) {
                 Some(p) => p,
                 None => {
-                    failures.push((adj.id.clone(), "Point not found".into()));
+                    failures.push((adj.id, "Point not found".into()));
                     continue;
                 }
             };
@@ -555,7 +574,7 @@ impl<S: DataStore + 'static> ProtocolClient for Iec104Channel<S> {
             let iec_addr = match &point.address {
                 crate::core::point::ProtocolAddress::Iec104(addr) => addr,
                 _ => {
-                    failures.push((adj.id.clone(), "Invalid address type".into()));
+                    failures.push((adj.id, "Invalid address type".into()));
                     continue;
                 }
             };
@@ -577,7 +596,7 @@ impl<S: DataStore + 'static> ProtocolClient for Iec104Channel<S> {
             match result {
                 Ok(()) => success_count += 1,
                 Err(e) => {
-                    failures.push((adj.id.clone(), e.to_string()));
+                    failures.push((adj.id, e.to_string()));
                 }
             }
         }
@@ -619,7 +638,7 @@ impl<S: DataStore + 'static> ProtocolClient for Iec104Channel<S> {
     }
 }
 
-impl<S: DataStore + 'static> EventDrivenProtocol for Iec104Channel<S> {
+impl EventDrivenProtocol for Iec104Channel {
     fn subscribe(&self) -> DataEventReceiver {
         // Note: This is a stub implementation that creates a new channel.
         // In a real implementation, we'd need to properly manage subscriptions.
@@ -709,7 +728,6 @@ fn convert_iec104_quality(quality: &voltage_iec104::Quality) -> Quality {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemoryStore;
 
     #[test]
     fn test_iec104_channel_config() {
@@ -724,9 +742,8 @@ mod tests {
 
     #[test]
     fn test_iec104_channel_capabilities() {
-        let store = Arc::new(MemoryStore::new());
         let config = Iec104ChannelConfig::new("127.0.0.1:2404");
-        let channel = Iec104Channel::new(config, store, 1);
+        let channel = Iec104Channel::new(config);
 
         assert_eq!(channel.name(), "IEC 60870-5-104");
         assert!(channel

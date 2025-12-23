@@ -41,7 +41,6 @@ pub mod codec;
 pub mod core;
 pub mod protocols;
 pub mod router;
-pub mod store;
 
 /// Prelude module for convenient imports
 pub mod prelude {
@@ -52,7 +51,6 @@ pub mod prelude {
         quality::*,
         traits::*,
     };
-    pub use crate::store::{DataStore, MemoryStore};
 }
 
 // Re-export core types at crate root for convenience
@@ -62,6 +60,3 @@ pub use crate::core::quality::Quality;
 pub use crate::core::traits::{
     CommunicationMode, ConnectionState, Protocol, ProtocolCapabilities, ProtocolClient,
 };
-
-// Re-export store types
-pub use crate::store::{DataStore, MemoryStore};

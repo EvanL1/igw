@@ -10,8 +10,8 @@ use crate::core::data::DataType;
 /// Protocol-agnostic point configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PointConfig {
-    /// Unique point identifier (application-level).
-    pub id: String,
+    /// Unique point identifier (numeric).
+    pub id: u32,
 
     /// Human-readable name (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,9 +42,9 @@ fn default_true() -> bool {
 
 impl PointConfig {
     /// Create a new point configuration.
-    pub fn new(id: impl Into<String>, data_type: DataType, address: ProtocolAddress) -> Self {
+    pub fn new(id: u32, data_type: DataType, address: ProtocolAddress) -> Self {
         Self {
-            id: id.into(),
+            id,
             name: None,
             data_type,
             address,

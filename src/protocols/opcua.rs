@@ -56,7 +56,6 @@ use crate::core::traits::{
     PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
     WriteResult,
 };
-use crate::store::DataStore;
 
 /// OPC UA security policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -269,7 +268,7 @@ pub struct OpcUaChannelConfig {
     pub points: Vec<PointConfig>,
 
     /// NodeID to point_id mapping (built from points).
-    node_id_mapping: HashMap<String, String>,
+    node_id_mapping: HashMap<String, u32>,
 }
 
 impl OpcUaChannelConfig {
@@ -385,7 +384,7 @@ impl OpcUaChannelConfig {
         for point in &points {
             if let ProtocolAddress::OpcUa(addr) = &point.address {
                 let key = make_node_id_key(addr.namespace_index, &addr.node_id);
-                self.node_id_mapping.insert(key, point.id.clone());
+                self.node_id_mapping.insert(key, point.id);
             }
         }
         self.points = points;
@@ -393,9 +392,9 @@ impl OpcUaChannelConfig {
     }
 
     /// Find point_id by NodeID.
-    pub fn find_point_id(&self, namespace_index: u16, identifier: &str) -> Option<&str> {
+    pub fn find_point_id(&self, namespace_index: u16, identifier: &str) -> Option<u32> {
         let key = make_node_id_key(namespace_index, identifier);
-        self.node_id_mapping.get(&key).map(|s| s.as_str())
+        self.node_id_mapping.get(&key).copied()
     }
 }
 
@@ -427,15 +426,14 @@ struct ChannelDiagnostics {
 ///
 /// This struct wraps an `async-opcua` client and implements
 /// igw's `Protocol`, `ProtocolClient`, and `EventDrivenProtocol` traits.
-pub struct OpcUaChannel<S: DataStore> {
+///
+/// Note: This adapter follows the "protocol layer separated from storage" design.
+/// The channel emits DataEvent::DataUpdate events; the service layer handles persistence.
+pub struct OpcUaChannel {
     /// Configuration.
     config: OpcUaChannelConfig,
     /// opcua session.
     session: Option<Arc<Session>>,
-    /// Data store.
-    store: Arc<S>,
-    /// Channel ID.
-    channel_id: u32,
     /// Connection state.
     state: Arc<std::sync::RwLock<ConnectionState>>,
     /// Diagnostics.
@@ -451,21 +449,14 @@ pub struct OpcUaChannel<S: DataStore> {
     subscription_id: Option<u32>,
 }
 
-impl<S: DataStore + 'static> OpcUaChannel<S> {
+impl OpcUaChannel {
     /// Create a new OPC UA channel.
-    pub fn new(config: OpcUaChannelConfig, store: Arc<S>, channel_id: u32) -> Self {
+    pub fn new(config: OpcUaChannelConfig) -> Self {
         let (event_tx, event_rx) = mpsc::channel(1024);
-
-        // Set point configs in store
-        if !config.points.is_empty() {
-            store.set_point_configs(channel_id, config.points.clone());
-        }
 
         Self {
             config,
             session: None,
-            store,
-            channel_id,
             state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
             diagnostics: Arc::new(RwLock::new(ChannelDiagnostics::default())),
             event_tx,
@@ -499,7 +490,7 @@ impl<S: DataStore + 'static> OpcUaChannel<S> {
     }
 
     /// Find point config by ID.
-    fn find_point(&self, id: &str) -> Option<&PointConfig> {
+    fn find_point(&self, id: u32) -> Option<&PointConfig> {
         self.config.points.iter().find(|p| p.id == id)
     }
 
@@ -510,8 +501,6 @@ impl<S: DataStore + 'static> OpcUaChannel<S> {
         let sub_config = &self.config.subscription;
 
         // Create subscription with data change callback
-        let store = self.store.clone();
-        let channel_id = self.channel_id;
         let event_tx = self.event_tx.clone();
         let diagnostics = self.diagnostics.clone();
         let config = self.config.clone();
@@ -527,7 +516,6 @@ impl<S: DataStore + 'static> OpcUaChannel<S> {
                 sub_config.publishing_enabled,
                 DataChangeCallback::new(move |data_value: DataValue, item: &MonitoredItem| {
                     // Clone for async block
-                    let store = store.clone();
                     let event_tx = event_tx.clone();
                     let diagnostics = diagnostics.clone();
                     let config = config.clone();
@@ -541,8 +529,6 @@ impl<S: DataStore + 'static> OpcUaChannel<S> {
                         handle_data_change(
                             &config,
                             &item_data,
-                            &store,
-                            channel_id,
                             &event_tx,
                             &diagnostics,
                             event_handler.as_ref(),
@@ -642,7 +628,7 @@ impl<S: DataStore + 'static> OpcUaChannel<S> {
     }
 }
 
-impl<S: DataStore> ProtocolCapabilities for OpcUaChannel<S> {
+impl ProtocolCapabilities for OpcUaChannel {
     fn name(&self) -> &'static str {
         "OPC UA"
     }
@@ -657,7 +643,7 @@ impl<S: DataStore> ProtocolCapabilities for OpcUaChannel<S> {
 }
 
 #[async_trait]
-impl<S: DataStore + 'static> Protocol for OpcUaChannel<S> {
+impl Protocol for OpcUaChannel {
     fn connection_state(&self) -> ConnectionState {
         self.get_state()
     }
@@ -751,7 +737,7 @@ impl<S: DataStore + 'static> Protocol for OpcUaChannel<S> {
 }
 
 #[async_trait]
-impl<S: DataStore + 'static> ProtocolClient for OpcUaChannel<S> {
+impl ProtocolClient for OpcUaChannel {
     async fn connect(&mut self) -> Result<()> {
         self.set_state(ConnectionState::Connecting);
 
@@ -854,10 +840,10 @@ impl<S: DataStore + 'static> ProtocolClient for OpcUaChannel<S> {
 
         for cmd in commands {
             // Find point config
-            let point = match self.find_point(&cmd.id) {
+            let point = match self.find_point(cmd.id) {
                 Some(p) => p,
                 None => {
-                    failures.push((cmd.id.clone(), "Point not found".into()));
+                    failures.push((cmd.id, "Point not found".into()));
                     continue;
                 }
             };
@@ -866,7 +852,7 @@ impl<S: DataStore + 'static> ProtocolClient for OpcUaChannel<S> {
             let opc_addr = match &point.address {
                 ProtocolAddress::OpcUa(addr) => addr,
                 _ => {
-                    failures.push((cmd.id.clone(), "Invalid address type".into()));
+                    failures.push((cmd.id, "Invalid address type".into()));
                     continue;
                 }
             };
@@ -889,14 +875,11 @@ impl<S: DataStore + 'static> ProtocolClient for OpcUaChannel<S> {
                     if results.first().map(|s| s.is_good()).unwrap_or(false) {
                         success_count += 1;
                     } else {
-                        failures.push((
-                            cmd.id.clone(),
-                            format!("Write failed: {:?}", results.first()),
-                        ));
+                        failures.push((cmd.id, format!("Write failed: {:?}", results.first())));
                     }
                 }
                 Err(e) => {
-                    failures.push((cmd.id.clone(), e.to_string()));
+                    failures.push((cmd.id, e.to_string()));
                 }
             }
         }
@@ -919,10 +902,10 @@ impl<S: DataStore + 'static> ProtocolClient for OpcUaChannel<S> {
 
         for adj in adjustments {
             // Find point config
-            let point = match self.find_point(&adj.id) {
+            let point = match self.find_point(adj.id) {
                 Some(p) => p,
                 None => {
-                    failures.push((adj.id.clone(), "Point not found".into()));
+                    failures.push((adj.id, "Point not found".into()));
                     continue;
                 }
             };
@@ -931,7 +914,7 @@ impl<S: DataStore + 'static> ProtocolClient for OpcUaChannel<S> {
             let opc_addr = match &point.address {
                 ProtocolAddress::OpcUa(addr) => addr,
                 _ => {
-                    failures.push((adj.id.clone(), "Invalid address type".into()));
+                    failures.push((adj.id, "Invalid address type".into()));
                     continue;
                 }
             };
@@ -954,14 +937,11 @@ impl<S: DataStore + 'static> ProtocolClient for OpcUaChannel<S> {
                     if results.first().map(|s| s.is_good()).unwrap_or(false) {
                         success_count += 1;
                     } else {
-                        failures.push((
-                            adj.id.clone(),
-                            format!("Write failed: {:?}", results.first()),
-                        ));
+                        failures.push((adj.id, format!("Write failed: {:?}", results.first())));
                     }
                 }
                 Err(e) => {
-                    failures.push((adj.id.clone(), e.to_string()));
+                    failures.push((adj.id, e.to_string()));
                 }
             }
         }
@@ -976,6 +956,23 @@ impl<S: DataStore + 'static> ProtocolClient for OpcUaChannel<S> {
             success_count,
             failures,
         })
+    }
+
+    async fn poll_once(&mut self) -> Result<DataBatch> {
+        // OPC UA is event-driven via subscriptions.
+        // Data changes are received asynchronously through the subscription callback.
+        // For poll_once, we check for any pending session events but typically
+        // return an empty batch since real data comes through DataChange callbacks.
+        //
+        // In a true polling scenario, you would call session.poll() here,
+        // but the OPC UA SDK handles this internally via async tasks.
+
+        if !self.get_state().is_connected() {
+            return Err(GatewayError::NotConnected);
+        }
+
+        // Return empty batch - data comes through subscription callbacks
+        Ok(DataBatch::new())
     }
 
     async fn start_polling(&mut self, _config: PollingConfig) -> Result<()> {
@@ -1005,7 +1002,7 @@ impl<S: DataStore + 'static> ProtocolClient for OpcUaChannel<S> {
     }
 }
 
-impl<S: DataStore + 'static> EventDrivenProtocol for OpcUaChannel<S> {
+impl EventDrivenProtocol for OpcUaChannel {
     fn subscribe(&self) -> DataEventReceiver {
         // Note: This is a stub implementation that creates a new channel.
         // In a real implementation, we'd need to properly manage subscriptions.
@@ -1040,11 +1037,12 @@ fn parse_node_id(identifier: &str, namespace_index: u16) -> NodeId {
 }
 
 /// Handle data change callback.
-async fn handle_data_change<S: DataStore>(
+///
+/// Processes OPC UA data change notifications and emits events.
+/// The service layer (comsrv) is responsible for persistence.
+async fn handle_data_change(
     config: &OpcUaChannelConfig,
     items: &[(NodeId, DataValue)],
-    store: &Arc<S>,
-    channel_id: u32,
     event_tx: &DataEventSender,
     diagnostics: &Arc<RwLock<ChannelDiagnostics>>,
     event_handler: Option<&Arc<dyn DataEventHandler>>,
@@ -1062,15 +1060,16 @@ async fn handle_data_change<S: DataStore>(
             }
         };
 
-        let point_id = config
-            .find_point_id(node_id.namespace, &identifier)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("ns{}_{}", node_id.namespace, identifier));
+        // Find mapped point_id (skip unconfigured nodes)
+        let point_id = match config.find_point_id(node_id.namespace, &identifier) {
+            Some(id) => id,
+            None => continue, // Skip unconfigured nodes
+        };
 
         // Find point config
         let point_config = config.points.iter().find(|p| p.id == point_id);
 
-        if let Some(dp) = convert_data_value_with_id(&point_id, point_config, data_value) {
+        if let Some(dp) = convert_data_value_with_id(point_id, point_config, data_value) {
             batch.add(dp);
         }
     }
@@ -1079,15 +1078,7 @@ async fn handle_data_change<S: DataStore>(
         return;
     }
 
-    // Write to DataStore
-    if let Err(e) = store.write_batch(channel_id, &batch).await {
-        let mut diag = diagnostics.write().await;
-        diag.error_count += 1;
-        diag.last_error = Some(e.to_string());
-        return;
-    }
-
-    // Send event
+    // Send event (service layer handles storage)
     let _ = event_tx.send(DataEvent::DataUpdate(batch.clone())).await;
 
     // Call event handler
@@ -1103,12 +1094,12 @@ async fn handle_data_change<S: DataStore>(
 
 /// Convert DataValue to DataPoint.
 fn convert_data_value_to_point(config: &PointConfig, dv: &DataValue) -> Option<DataPoint> {
-    convert_data_value_with_id(&config.id, Some(config), dv)
+    convert_data_value_with_id(config.id, Some(config), dv)
 }
 
 /// Convert DataValue to DataPoint with explicit ID.
 fn convert_data_value_with_id(
-    point_id: &str,
+    point_id: u32,
     config: Option<&PointConfig>,
     dv: &DataValue,
 ) -> Option<DataPoint> {
@@ -1152,7 +1143,7 @@ fn convert_data_value_with_id(
     };
 
     Some(DataPoint {
-        id: point_id.to_string(),
+        id: point_id,
         data_type,
         value: final_value,
         quality,
@@ -1199,7 +1190,6 @@ fn opcua_datetime_to_chrono(dt: &opcua::types::DateTime) -> Option<DateTime<Utc>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemoryStore;
 
     #[test]
     fn test_opcua_config() {
@@ -1253,9 +1243,8 @@ mod tests {
 
     #[test]
     fn test_channel_capabilities() {
-        let store = Arc::new(MemoryStore::new());
         let config = OpcUaChannelConfig::new("opc.tcp://localhost:4840");
-        let channel = OpcUaChannel::new(config, store, 1);
+        let channel = OpcUaChannel::new(config);
 
         assert_eq!(channel.name(), "OPC UA");
         assert!(channel

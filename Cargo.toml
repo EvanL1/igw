@@ -1,6 +1,6 @@
 [package]
 name = "igw"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Industrial Gateway - Universal SCADA Protocol Library for Rust"
@@ -10,11 +10,18 @@ keywords = ["scada", "industrial", "protocols", "four-remote", "gateway"]
 categories = ["embedded", "network-programming", "hardware-support"]
 readme = "README.md"
 
+[[bin]]
+name = "igw"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [features]
 default = []
 
 # Protocol support
-modbus = ["dep:voltage_modbus"]
+modbus = ["modbus-tcp"]  # Backward compatible alias
+modbus-tcp = ["dep:voltage_modbus", "tracing-support"]
+modbus-rtu = ["modbus-tcp", "voltage_modbus/rtu"]
 iec104 = ["dep:voltage_iec104"]
 j1939 = ["dep:socketcan", "dep:voltage_j1939"]
 opcua = ["dep:async-opcua"]
@@ -31,12 +38,15 @@ serial = ["dep:tokio-serial"]
 # Utilities
 tracing-support = ["dep:tracing"]
 
+# CLI support
+cli = ["dep:clap", "dep:toml"]
+
 # Full feature set
-full = ["modbus", "iec104", "j1939", "opcua", "serial", "tracing-support", "virtual-channel", "gpio"]
+full = ["modbus-tcp", "modbus-rtu", "iec104", "j1939", "opcua", "serial", "tracing-support", "virtual-channel", "gpio"]
 
 [dependencies]
 # Core async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros", "signal"] }
 async-trait = "0.1"
 
 # Serialization
@@ -69,6 +79,10 @@ voltage_iec104 = { version = "0.1", optional = true }
 
 # Optional: OPC UA protocol support
 async-opcua = { version = "0.14", default-features = false, features = ["client"], optional = true }
+
+# Optional: CLI support
+clap = { version = "4", features = ["derive"], optional = true }
+toml = { version = "0.8", optional = true }
 
 # Optional: J1939/CAN protocol support (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
