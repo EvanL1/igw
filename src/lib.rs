@@ -40,7 +40,6 @@
 pub mod codec;
 pub mod core;
 pub mod protocols;
-pub mod router;
 
 /// Prelude module for convenient imports
 pub mod prelude {

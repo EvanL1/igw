@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core::data::DataType;
+use crate::core::error::GatewayError;
 
 /// Protocol-agnostic point configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,18 +56,21 @@ impl PointConfig {
     }
 
     /// Set the point name.
+    #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
     /// Set the transform configuration.
+    #[must_use]
     pub fn with_transform(mut self, transform: TransformConfig) -> Self {
         self.transform = transform;
         self
     }
 
     /// Set the poll group.
+    #[must_use]
     pub fn with_poll_group(mut self, group: impl Into<String>) -> Self {
         self.poll_group = Some(group.into());
         self
@@ -184,6 +188,7 @@ impl GpioAddress {
     }
 
     /// Set active low mode.
+    #[must_use]
     pub fn with_active_low(mut self, active_low: bool) -> Self {
         self.active_low = active_low;
         self
@@ -413,7 +418,7 @@ pub enum ByteOrder {
 
 impl ByteOrder {
     /// Get the byte order string for debugging.
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Abcd => "ABCD",
             Self::Dcba => "DCBA",
@@ -471,8 +476,15 @@ impl TransformConfig {
     }
 
     /// Apply reverse transform to get raw value.
-    pub fn reverse_apply(&self, value: f64) -> f64 {
-        (value - self.offset) / self.scale
+    ///
+    /// Returns an error if `scale` is zero (division by zero).
+    pub fn reverse_apply(&self, value: f64) -> Result<f64, GatewayError> {
+        if self.scale == 0.0 {
+            return Err(GatewayError::DataConversion(
+                "Cannot reverse transform: scale is zero".into(),
+            ));
+        }
+        Ok((value - self.offset) / self.scale)
     }
 
     /// Apply boolean reverse if configured.
@@ -502,7 +514,13 @@ mod tests {
     fn test_transform() {
         let t = TransformConfig::linear(0.1, 10.0);
         assert_eq!(t.apply(100.0), 20.0); // 100 * 0.1 + 10 = 20
-        assert_eq!(t.reverse_apply(20.0), 100.0);
+        assert_eq!(t.reverse_apply(20.0).unwrap(), 100.0);
+    }
+
+    #[test]
+    fn test_transform_zero_scale() {
+        let t = TransformConfig::linear(0.0, 10.0);
+        assert!(t.reverse_apply(20.0).is_err());
     }
 
     #[test]

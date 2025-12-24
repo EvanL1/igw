@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use socketcan::{CanSocket, EmbeddedFrame, Frame, Socket};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
@@ -221,7 +220,6 @@ impl ProtocolCapabilities for J1939Client {
     }
 }
 
-#[async_trait]
 impl Protocol for J1939Client {
     fn connection_state(&self) -> ConnectionState {
         *futures::executor::block_on(self.connection_state.read())
@@ -288,7 +286,6 @@ impl Protocol for J1939Client {
     }
 }
 
-#[async_trait]
 impl ProtocolClient for J1939Client {
     async fn connect(&mut self) -> Result<()> {
         *self.connection_state.write().await = ConnectionState::Connecting;
@@ -373,7 +370,6 @@ impl ProtocolClient for J1939Client {
     }
 }
 
-#[async_trait]
 impl EventDrivenProtocol for J1939Client {
     fn subscribe(&self) -> DataEventReceiver {
         // This is a simplified implementation

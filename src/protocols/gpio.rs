@@ -29,7 +29,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use crate::core::data::{DataBatch, DataPoint};
@@ -253,7 +252,6 @@ impl ProtocolCapabilities for GpioChannel {
     }
 }
 
-#[async_trait]
 impl Protocol for GpioChannel {
     fn connection_state(&self) -> ConnectionState {
         self.get_state()
@@ -327,7 +325,6 @@ impl Protocol for GpioChannel {
     }
 }
 
-#[async_trait]
 impl ProtocolClient for GpioChannel {
     async fn connect(&mut self) -> Result<()> {
         // In a real implementation, validate GPIO chips and pins exist

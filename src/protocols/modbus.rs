@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
@@ -883,7 +882,7 @@ impl ModbusChannel {
         };
 
         // Apply reverse transform to get raw value
-        let raw_value = reverse_transform(adj.value, &point.transform);
+        let raw_value = reverse_transform(adj.value, &point.transform)?;
 
         // Create batch command
         let batch_cmd = BatchCommand {
@@ -1093,7 +1092,6 @@ impl ProtocolCapabilities for ModbusChannel {
     }
 }
 
-#[async_trait]
 impl Protocol for ModbusChannel {
     fn connection_state(&self) -> ConnectionState {
         self.get_state()
@@ -1126,7 +1124,6 @@ impl Protocol for ModbusChannel {
     }
 }
 
-#[async_trait]
 impl ProtocolClient for ModbusChannel {
     async fn connect(&mut self) -> Result<()> {
         self.set_state(ConnectionState::Connecting);
@@ -1199,8 +1196,12 @@ impl ProtocolClient for ModbusChannel {
             None => return Err(GatewayError::NotConnected),
         };
 
-        // Read all point groups
-        let groups = self.grouped_points.read().await;
+        // Read all point groups - clone to release lock before async I/O
+        let groups: Vec<_> = {
+            let g = self.grouped_points.read().await;
+            g.iter().map(|(k, v)| (*k, v.clone())).collect()
+        }; // Lock released here
+
         let mut batch = DataBatch::default();
         let mut read_count = 0u64;
         let mut error_count = 0u64;
@@ -1350,7 +1351,13 @@ impl ProtocolClient for ModbusChannel {
             };
 
             // Apply reverse transform to get raw value
-            let raw_value = reverse_transform(adj.value, &point.transform);
+            let raw_value = match reverse_transform(adj.value, &point.transform) {
+                Ok(v) => v,
+                Err(e) => {
+                    failures.push((adj.id, e.to_string()));
+                    continue;
+                }
+            };
 
             // Encode and write register(s)
             let result = match modbus_addr.format {
@@ -1559,8 +1566,12 @@ impl ProtocolClient for ModbusChannel {
 
                 let client_ref = client_guard.as_mut().unwrap();
 
-                // Read all point groups
-                let groups = grouped_points.read().await;
+                // Read all point groups - clone to release lock before async I/O
+                let groups: Vec<_> = {
+                    let g = grouped_points.read().await;
+                    g.iter().map(|(k, v)| (*k, v.clone())).collect()
+                }; // Lock released here
+
                 let mut batch = DataBatch::default();
                 let mut read_count = 0u64;
                 let mut error_count = 0u64;
@@ -1680,7 +1691,10 @@ fn apply_transform(value: Value, transform: &crate::core::point::TransformConfig
 }
 
 /// Reverse transform to get raw value.
-fn reverse_transform(value: f64, transform: &crate::core::point::TransformConfig) -> f64 {
+fn reverse_transform(
+    value: f64,
+    transform: &crate::core::point::TransformConfig,
+) -> crate::Result<f64> {
     transform.reverse_apply(value)
 }
 

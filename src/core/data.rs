@@ -38,7 +38,7 @@ pub enum DataType {
 
 impl DataType {
     /// Get the short code for this data type.
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Telemetry => "T",
             Self::Signal => "S",
@@ -81,7 +81,7 @@ impl std::fmt::Display for DataType {
 /// A protocol-agnostic value representation.
 ///
 /// This enum provides a unified way to represent values from different protocols.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
     /// Floating-point number (most common for telemetry/adjustment)
@@ -100,6 +100,7 @@ pub enum Value {
     Bytes(Vec<u8>),
 
     /// Null/missing value
+    #[default]
     Null,
 }
 
@@ -146,12 +147,6 @@ impl Value {
     #[inline]
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
-    }
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Self::Null
     }
 }
 
@@ -274,12 +269,14 @@ impl DataPoint {
     }
 
     /// Set the quality.
+    #[must_use]
     pub fn with_quality(mut self, quality: Quality) -> Self {
         self.quality = quality;
         self
     }
 
     /// Set the source timestamp.
+    #[must_use]
     pub fn with_source_timestamp(mut self, ts: DateTime<Utc>) -> Self {
         self.source_timestamp = Some(ts);
         self

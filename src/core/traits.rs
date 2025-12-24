@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -54,13 +55,13 @@ pub enum ConnectionState {
 impl ConnectionState {
     /// Check if currently connected.
     #[inline]
-    pub fn is_connected(&self) -> bool {
+    pub const fn is_connected(&self) -> bool {
         matches!(self, Self::Connected)
     }
 
     /// Check if retry is possible.
     #[inline]
-    pub fn can_retry(&self) -> bool {
+    pub const fn can_retry(&self) -> bool {
         matches!(self, Self::Disconnected | Self::Error)
     }
 }
@@ -316,26 +317,24 @@ pub trait ProtocolCapabilities {
 }
 
 /// Base protocol trait - read-only operations.
-#[async_trait]
 pub trait Protocol: ProtocolCapabilities + Send + Sync {
     /// Get current connection state.
     fn connection_state(&self) -> ConnectionState;
 
     /// Read data points.
-    async fn read(&self, request: ReadRequest) -> Result<ReadResponse>;
+    fn read(&self, request: ReadRequest) -> impl Future<Output = Result<ReadResponse>> + Send;
 
     /// Get diagnostics information.
-    async fn diagnostics(&self) -> Result<Diagnostics>;
+    fn diagnostics(&self) -> impl Future<Output = Result<Diagnostics>> + Send;
 }
 
 /// Client protocol trait - active connection + write operations.
-#[async_trait]
 pub trait ProtocolClient: Protocol {
     /// Connect to the target device/server.
-    async fn connect(&mut self) -> Result<()>;
+    fn connect(&mut self) -> impl Future<Output = Result<()>> + Send;
 
     /// Disconnect from the target.
-    async fn disconnect(&mut self) -> Result<()>;
+    fn disconnect(&mut self) -> impl Future<Output = Result<()>> + Send;
 
     /// Execute a single poll cycle and return collected data.
     ///
@@ -346,38 +345,37 @@ pub trait ProtocolClient: Protocol {
     /// # Returns
     ///
     /// A `DataBatch` containing all successfully read points from configured sources.
-    async fn poll_once(&mut self) -> Result<DataBatch>;
+    fn poll_once(&mut self) -> impl Future<Output = Result<DataBatch>> + Send;
 
     /// Write control commands.
-    async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult>;
+    fn write_control(
+        &mut self,
+        commands: &[ControlCommand],
+    ) -> impl Future<Output = Result<WriteResult>> + Send;
 
     /// Write adjustment commands.
-    async fn write_adjustment(&mut self, adjustments: &[AdjustmentCommand]) -> Result<WriteResult>;
+    fn write_adjustment(
+        &mut self,
+        adjustments: &[AdjustmentCommand],
+    ) -> impl Future<Output = Result<WriteResult>> + Send;
 
     /// Start polling task (legacy, prefer using poll_once() with external loop).
     ///
     /// This method is kept for backward compatibility. New implementations
     /// should use `poll_once()` with an external polling loop managed by the service layer.
-    async fn start_polling(&mut self, config: PollingConfig) -> Result<()>;
+    fn start_polling(&mut self, config: PollingConfig) -> impl Future<Output = Result<()>> + Send;
 
     /// Stop polling task.
-    async fn stop_polling(&mut self) -> Result<()>;
-
-    /// Attempt to reconnect after a failure.
-    async fn try_reconnect(&mut self) -> Result<()> {
-        self.disconnect().await.ok();
-        self.connect().await
-    }
+    fn stop_polling(&mut self) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// Server protocol trait - passive connection acceptance.
-#[async_trait]
 pub trait ProtocolServer: Protocol {
     /// Start listening on the specified address.
-    async fn listen(&mut self, addr: &str) -> Result<()>;
+    fn listen(&mut self, addr: &str) -> impl Future<Output = Result<()>> + Send;
 
     /// Stop listening and close all connections.
-    async fn stop(&mut self) -> Result<()>;
+    fn stop(&mut self) -> impl Future<Output = Result<()>> + Send;
 
     /// Get number of connected clients.
     fn connected_clients(&self) -> usize;
@@ -406,6 +404,8 @@ pub type DataEventReceiver = mpsc::Receiver<DataEvent>;
 pub type DataEventSender = mpsc::Sender<DataEvent>;
 
 /// Event handler trait.
+///
+/// This trait uses `async_trait` because it needs to be object-safe for `dyn DataEventHandler`.
 #[async_trait]
 pub trait DataEventHandler: Send + Sync {
     /// Handle data update event.
@@ -419,7 +419,6 @@ pub trait DataEventHandler: Send + Sync {
 }
 
 /// Event-driven protocol extension trait.
-#[async_trait]
 pub trait EventDrivenProtocol: Protocol {
     /// Subscribe to data events.
     fn subscribe(&self) -> DataEventReceiver;

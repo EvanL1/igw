@@ -35,7 +35,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use opcua::client::{ClientBuilder, DataChangeCallback, IdentityToken, MonitoredItem, Session};
 use opcua::crypto::SecurityPolicy;
@@ -126,9 +125,10 @@ impl OpcUaMessageSecurityMode {
 }
 
 /// OPC UA identity/authentication configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum OpcUaIdentity {
     /// Anonymous authentication.
+    #[default]
     Anonymous,
     /// Username/password authentication.
     UserName {
@@ -137,12 +137,6 @@ pub enum OpcUaIdentity {
         /// Password.
         password: String,
     },
-}
-
-impl Default for OpcUaIdentity {
-    fn default() -> Self {
-        Self::Anonymous
-    }
 }
 
 impl OpcUaIdentity {
@@ -501,9 +495,10 @@ impl OpcUaChannel {
         let sub_config = &self.config.subscription;
 
         // Create subscription with data change callback
+        // Use Arc to avoid cloning the entire config on each callback invocation
         let event_tx = self.event_tx.clone();
         let diagnostics = self.diagnostics.clone();
-        let config = self.config.clone();
+        let config = Arc::new(self.config.clone()); // Clone once, wrap in Arc
         let event_handler = self.event_handler.clone();
 
         let subscription_id = session
@@ -515,10 +510,10 @@ impl OpcUaChannel {
                 sub_config.priority,
                 sub_config.publishing_enabled,
                 DataChangeCallback::new(move |data_value: DataValue, item: &MonitoredItem| {
-                    // Clone for async block
+                    // Clone Arc (cheap reference count increment) instead of full config
                     let event_tx = event_tx.clone();
                     let diagnostics = diagnostics.clone();
-                    let config = config.clone();
+                    let config = Arc::clone(&config);
                     let event_handler = event_handler.clone();
 
                     // Collect the data we need before spawning
@@ -642,7 +637,6 @@ impl ProtocolCapabilities for OpcUaChannel {
     }
 }
 
-#[async_trait]
 impl Protocol for OpcUaChannel {
     fn connection_state(&self) -> ConnectionState {
         self.get_state()
@@ -653,7 +647,7 @@ impl Protocol for OpcUaChannel {
         let _session = self
             .session
             .as_ref()
-            .ok_or_else(|| GatewayError::NotConnected)?;
+            .ok_or(GatewayError::NotConnected)?;
 
         // Determine points to read
         let points_to_read: Vec<_> = if let Some(ids) = &request.point_ids {
@@ -736,7 +730,6 @@ impl Protocol for OpcUaChannel {
     }
 }
 
-#[async_trait]
 impl ProtocolClient for OpcUaChannel {
     async fn connect(&mut self) -> Result<()> {
         self.set_state(ConnectionState::Connecting);
@@ -920,7 +913,13 @@ impl ProtocolClient for OpcUaChannel {
             };
 
             // Apply reverse transform
-            let raw_value = point.transform.reverse_apply(adj.value);
+            let raw_value = match point.transform.reverse_apply(adj.value) {
+                Ok(v) => v,
+                Err(e) => {
+                    failures.push((adj.id, e.to_string()));
+                    continue;
+                }
+            };
 
             // Build write request
             let node_id = parse_node_id(&opc_addr.node_id, opc_addr.namespace_index);

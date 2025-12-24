@@ -27,7 +27,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, RwLock};
 
@@ -189,7 +188,6 @@ impl ProtocolCapabilities for VirtualChannel {
     }
 }
 
-#[async_trait]
 impl Protocol for VirtualChannel {
     fn connection_state(&self) -> ConnectionState {
         // Virtual channels are always "connected"
@@ -247,7 +245,6 @@ impl Protocol for VirtualChannel {
     }
 }
 
-#[async_trait]
 impl ProtocolClient for VirtualChannel {
     async fn connect(&mut self) -> Result<()> {
         // Virtual channel is always connected - no-op

@@ -7,8 +7,8 @@ A universal SCADA protocol library for Rust, providing unified abstractions for 
 - **Protocol Agnostic**: Unified four-remote (T/S/C/A) data model
 - **Dual Mode Support**: Polling and event-driven communication
 - **Zero Business Coupling**: Pure protocol layer, no business logic dependencies
-- **DataStore Abstraction**: Pluggable storage (MemoryStore, RedisStore)
-- **Modular Design**: Protocol implementations in separate crates (pluggable)
+- **Native Async Traits**: Uses Rust 1.92+ RPITIT (no async_trait macro)
+- **Modular Design**: Protocol implementations via feature flags
 
 ## Supported Protocols
 
@@ -28,43 +28,45 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-igw = "0.1"                           # Core traits and data model
-# igw = { version = "0.1", features = ["modbus"] }  # With Modbus adapter
+igw = "0.2"                                    # Core traits and data model
+# igw = { version = "0.2", features = ["modbus"] }  # With Modbus adapter
+# igw = { version = "0.2", features = ["full"] }    # All protocols
 ```
+
+**Minimum Rust Version**: 1.85+
 
 ### Features
 
 | Feature | Description |
 |---------|-------------|
-| `modbus` | Modbus TCP adapter (requires `voltage_modbus`) |
+| `modbus` | Modbus TCP/RTU adapter |
+| `iec104` | IEC 60870-5-104 adapter |
+| `opcua` | OPC UA client adapter |
+| `j1939` | J1939/CAN bus (Linux only) |
+| `gpio` | GPIO DI/DO (Linux only) |
+| `virtual-channel` | Virtual data channel |
 | `serial` | Serial port support |
 | `tracing-support` | Tracing integration |
 | `full` | All features |
 
 ## Quick Start
 
-### Using DataStore
+### Basic Data Model
 
 ```rust
 use igw::prelude::*;
-use std::sync::Arc;
 
-#[tokio::main]
-async fn main() -> igw::Result<()> {
-    // Create an in-memory data store
-    let store = Arc::new(MemoryStore::new());
+fn main() {
+    // Create data points using the four-remote model
+    let temp = DataPoint::telemetry("temperature", 25.5);
+    let door = DataPoint::signal("door_open", true);
 
-    // Write some data
+    // Batch multiple points
     let mut batch = DataBatch::default();
-    batch.add(DataPoint::telemetry("temperature", 25.5));
-    batch.add(DataPoint::signal("door_open", true));
-    store.write_batch(1, &batch).await?;
+    batch.add(temp);
+    batch.add(door);
 
-    // Read data back
-    let point = store.read_point(1, "temperature").await?;
-    println!("Temperature: {:?}", point.map(|p| p.value));
-
-    Ok(())
+    println!("Batch contains {} points", batch.points.len());
 }
 ```
 
@@ -73,27 +75,64 @@ async fn main() -> igw::Result<()> {
 ```rust
 use igw::prelude::*;
 use igw::protocols::modbus::{ModbusChannel, ModbusChannelConfig};
-use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> igw::Result<()> {
-    let store = Arc::new(MemoryStore::new());
+    // Configure Modbus TCP connection
+    let config = ModbusChannelConfig::tcp("192.168.1.100:502")
+        .with_timeout(Duration::from_secs(5));
 
-    // Create Modbus channel
-    let config = ModbusChannelConfig::tcp("192.168.1.100:502");
-    let mut channel = ModbusChannel::new(config, store);
+    let mut channel = ModbusChannel::new(config);
 
     // Connect to device
     channel.connect().await?;
 
+    // Execute a single poll cycle
+    let batch = channel.poll_once().await?;
+    println!("Read {} points", batch.points.len());
+
     // Write control command
     let result = channel.write_control(&[
-        ControlCommand { id: "pump".into(), value: true }
+        ControlCommand::latching("pump", true)
     ]).await?;
-
     println!("Success: {}", result.success_count);
 
     channel.disconnect().await?;
+    Ok(())
+}
+```
+
+### With IEC 104 (Event-Driven)
+
+```rust
+use igw::prelude::*;
+use igw::protocols::iec104::{Iec104Channel, Iec104ChannelConfig};
+
+#[tokio::main]
+async fn main() -> igw::Result<()> {
+    let config = Iec104ChannelConfig::new("192.168.1.100:2404");
+    let mut channel = Iec104Channel::new(config);
+
+    channel.connect().await?;
+
+    // Subscribe to data events
+    let mut rx = channel.subscribe();
+
+    // Start receiving spontaneous data
+    channel.start_polling(PollingConfig::default()).await?;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            DataEvent::PointUpdate(point) => {
+                println!("Point {}: {:?}", point.id, point.value);
+            }
+            DataEvent::BatchUpdate(batch) => {
+                println!("Received {} points", batch.points.len());
+            }
+            _ => {}
+        }
+    }
+
     Ok(())
 }
 ```
@@ -116,8 +155,8 @@ The library uses the "Four Remotes" concept common in SCADA systems:
 ```rust
 pub trait Protocol: Send + Sync {
     fn connection_state(&self) -> ConnectionState;
-    async fn read(&self, request: ReadRequest) -> Result<ReadResponse>;
-    async fn diagnostics(&self) -> Result<Diagnostics>;
+    fn read(&self, request: ReadRequest) -> impl Future<Output = Result<ReadResponse>> + Send;
+    fn diagnostics(&self) -> impl Future<Output = Result<Diagnostics>> + Send;
 }
 ```
 
@@ -125,12 +164,13 @@ pub trait Protocol: Send + Sync {
 
 ```rust
 pub trait ProtocolClient: Protocol {
-    async fn connect(&mut self) -> Result<()>;
-    async fn disconnect(&mut self) -> Result<()>;
-    async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult>;
-    async fn write_adjustment(&mut self, adjustments: &[AdjustmentCommand]) -> Result<WriteResult>;
-    async fn start_polling(&mut self, config: PollingConfig) -> Result<()>;
-    async fn stop_polling(&mut self) -> Result<()>;
+    fn connect(&mut self) -> impl Future<Output = Result<()>> + Send;
+    fn disconnect(&mut self) -> impl Future<Output = Result<()>> + Send;
+    fn poll_once(&mut self) -> impl Future<Output = Result<DataBatch>> + Send;
+    fn write_control(&mut self, commands: &[ControlCommand]) -> impl Future<Output = Result<WriteResult>> + Send;
+    fn write_adjustment(&mut self, adjustments: &[AdjustmentCommand]) -> impl Future<Output = Result<WriteResult>> + Send;
+    fn start_polling(&mut self, config: PollingConfig) -> impl Future<Output = Result<()>> + Send;
+    fn stop_polling(&mut self) -> impl Future<Output = Result<()>> + Send;
 }
 ```
 

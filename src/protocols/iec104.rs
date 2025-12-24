@@ -33,7 +33,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use tokio::sync::{mpsc, RwLock};
 use voltage_iec104::{ClientConfig, Cp56Time2a, Iec104Client, Iec104Event};
@@ -172,6 +171,8 @@ pub struct Iec104Channel {
     event_rx: Option<DataEventReceiver>,
     event_handler: Option<Arc<dyn DataEventHandler>>,
     poll_task: Option<tokio::task::JoinHandle<()>>,
+    /// Point ID -> index lookup for O(1) access
+    point_index: HashMap<u32, usize>,
 }
 
 #[derive(Debug, Default)]
@@ -190,6 +191,14 @@ impl Iec104Channel {
         let client = Iec104Client::new(client_config);
         let (event_tx, event_rx) = mpsc::channel(1024);
 
+        // Build point ID -> index mapping for O(1) lookup
+        let point_index: HashMap<u32, usize> = config
+            .points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id, i))
+            .collect();
+
         Self {
             config,
             client,
@@ -199,6 +208,7 @@ impl Iec104Channel {
             event_rx: Some(event_rx),
             event_handler: None,
             poll_task: None,
+            point_index,
         }
     }
 
@@ -387,9 +397,11 @@ impl Iec104Channel {
         diag.last_error = Some(error.to_string());
     }
 
-    /// Find point config by ID.
+    /// Find point config by ID (O(1) lookup).
     fn find_point(&self, id: u32) -> Option<&PointConfig> {
-        self.config.points.iter().find(|p| p.id == id)
+        self.point_index
+            .get(&id)
+            .map(|&idx| &self.config.points[idx])
     }
 }
 
@@ -407,7 +419,6 @@ impl ProtocolCapabilities for Iec104Channel {
     }
 }
 
-#[async_trait]
 impl Protocol for Iec104Channel {
     fn connection_state(&self) -> ConnectionState {
         self.get_state()
@@ -442,7 +453,6 @@ impl Protocol for Iec104Channel {
     }
 }
 
-#[async_trait]
 impl ProtocolClient for Iec104Channel {
     async fn connect(&mut self) -> Result<()> {
         self.set_state(ConnectionState::Connecting);
@@ -580,7 +590,13 @@ impl ProtocolClient for Iec104Channel {
             };
 
             // Apply reverse transform
-            let raw_value = point.transform.reverse_apply(adj.value) as f32;
+            let raw_value = match point.transform.reverse_apply(adj.value) {
+                Ok(v) => v as f32,
+                Err(e) => {
+                    failures.push((adj.id, e.to_string()));
+                    continue;
+                }
+            };
 
             // Send setpoint command
             let result = self
@@ -698,17 +714,19 @@ fn cp56time2a_to_datetime(time: &Cp56Time2a) -> Option<DateTime<Utc>> {
 
 /// Create Cp56Time2a from current time.
 fn cp56time2a_now() -> Cp56Time2a {
+    use chrono::Datelike;
+    use chrono::Timelike;
+
     let now = Utc::now();
 
     Cp56Time2a {
-        milliseconds: (now.timestamp_subsec_millis() as u16)
-            + (now.format("%S").to_string().parse::<u16>().unwrap_or(0) * 1000),
-        minutes: now.format("%M").to_string().parse().unwrap_or(0),
-        hours: now.format("%H").to_string().parse().unwrap_or(0),
-        day: now.format("%d").to_string().parse().unwrap_or(1),
-        day_of_week: now.format("%u").to_string().parse().unwrap_or(1),
-        month: now.format("%m").to_string().parse().unwrap_or(1),
-        year: ((now.format("%Y").to_string().parse::<u16>().unwrap_or(2000) - 2000) & 0x7F) as u8,
+        milliseconds: now.second() as u16 * 1000 + now.timestamp_subsec_millis() as u16,
+        minutes: now.minute() as u8,
+        hours: now.hour() as u8,
+        day: now.day() as u8,
+        day_of_week: now.weekday().num_days_from_monday() as u8 + 1, // 1=Monday
+        month: now.month() as u8,
+        year: ((now.year() as u16).saturating_sub(2000) & 0x7F) as u8,
         invalid: false,
         summer_time: false,
     }
