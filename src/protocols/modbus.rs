@@ -1470,10 +1470,40 @@ impl ProtocolClient for ModbusChannel {
                 }
             };
 
-            // Write coil (FC05)
-            let result = client
-                .write_05(modbus_addr.slave_id, modbus_addr.register, cmd.value)
-                .await;
+            // Apply reverse transform for control (boolean inversion)
+            let value = point.transform.apply_bool(cmd.value);
+
+            // Write based on function_code from mapping
+            let result = match modbus_addr.function_code {
+                5 => {
+                    // FC05: Write Single Coil (bool)
+                    client
+                        .write_05(modbus_addr.slave_id, modbus_addr.register, value)
+                        .await
+                }
+                6 => {
+                    // FC06: Write Single Register (u16)
+                    // Convert bool to 0/1
+                    let reg_value = if value { 1u16 } else { 0u16 };
+                    client
+                        .write_06(modbus_addr.slave_id, modbus_addr.register, reg_value)
+                        .await
+                }
+                16 => {
+                    // FC16: Write Multiple Registers
+                    let reg_value = if value { 1u16 } else { 0u16 };
+                    client
+                        .write_10(modbus_addr.slave_id, modbus_addr.register, &[reg_value])
+                        .await
+                }
+                fc => {
+                    failures.push((
+                        cmd.id,
+                        format!("Unsupported function code {} for control", fc),
+                    ));
+                    continue;
+                }
+            };
 
             match result {
                 Ok(_) => {
