@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use socketcan::{CanSocket, EmbeddedFrame, Frame, Socket, SocketOptions};
-use tokio::sync::RwLock;
 use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use crate::core::data::{DataBatch, DataPoint, DataType, Value};
@@ -40,8 +40,8 @@ pub struct CanClient {
     is_connected: Arc<AtomicBool>,
 
     // Statistics
-    read_count: AtomicU64,
-    error_count: AtomicU64,
+    read_count: Arc<AtomicU64>,
+    error_count: Arc<AtomicU64>,
     last_error: Arc<RwLock<Option<String>>>,
 
     // Tasks
@@ -71,8 +71,8 @@ impl CanClient {
             config,
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             is_connected: Arc::new(AtomicBool::new(false)),
-            read_count: AtomicU64::new(0),
-            error_count: AtomicU64::new(0),
+            read_count: Arc::new(AtomicU64::new(0)),
+            error_count: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(RwLock::new(None)),
             receive_handle: None,
             read_handle: None,
@@ -89,20 +89,24 @@ impl CanClient {
     pub fn add_points(&mut self, points: Vec<super::config::CanPoint>) {
         #[cfg(feature = "tracing-support")]
         tracing::info!("Adding {} CAN points to client", points.len());
-        
+
         let point_manager = Arc::get_mut(&mut self.point_manager)
             .expect("PointManager should be uniquely owned before connect()");
-        
+
         for point in points {
             #[cfg(feature = "tracing-support")]
             tracing::debug!(
                 "Adding point {}: CAN_ID=0x{:03X}, byte_offset={}, bit_pos={}, bit_len={}",
-                point.point_id, point.can_id, point.byte_offset, point.bit_position, point.bit_length
+                point.point_id,
+                point.can_id,
+                point.byte_offset,
+                point.bit_position,
+                point.bit_length
             );
-            
+
             point_manager.add_point(point);
         }
-        
+
         #[cfg(feature = "tracing-support")]
         tracing::info!("CAN points added successfully");
     }
@@ -112,14 +116,14 @@ impl CanClient {
         let can_interface = self.config.can_interface.clone();
         let is_connected = Arc::clone(&self.is_connected);
         let frame_cache = Arc::clone(&self.frame_cache);
-        let error_count = Arc::new(AtomicU64::new(0));
+        let error_count = Arc::clone(&self.error_count);
         let last_error = Arc::clone(&self.last_error);
         let rx_poll_interval = self.config.rx_poll_interval_ms;
 
         let handle = tokio::spawn(async move {
             #[cfg(feature = "tracing-support")]
             tracing::info!("Starting CAN socket open on interface: {}", can_interface);
-            
+
             let socket = match CanSocket::open(&can_interface) {
                 Ok(s) => {
                     #[cfg(feature = "tracing-support")]
@@ -129,9 +133,8 @@ impl CanClient {
                 Err(e) => {
                     #[cfg(feature = "tracing-support")]
                     tracing::error!("Failed to open CAN socket on {}: {}", can_interface, e);
-                    
-                    *last_error.write().await =
-                        Some(format!("Failed to open CAN socket: {}", e));
+
+                    *last_error.write().await = Some(format!("Failed to open CAN socket: {}", e));
                     error_count.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -141,22 +144,25 @@ impl CanClient {
             if let Err(e) = socket.set_nonblocking(true) {
                 #[cfg(feature = "tracing-support")]
                 tracing::error!("Failed to set non-blocking mode: {}", e);
-                
-                *last_error.write().await =
-                    Some(format!("Failed to set non-blocking mode: {}", e));
+
+                *last_error.write().await = Some(format!("Failed to set non-blocking mode: {}", e));
                 error_count.fetch_add(1, Ordering::Relaxed);
                 return;
             }
 
             #[cfg(feature = "tracing-support")]
             tracing::info!("CAN socket configured successfully, starting receive loop");
-            
+
             #[cfg(feature = "tracing-support")]
-            tracing::info!("CAN receive task started on {} (rx_poll_interval={}ms)", can_interface, rx_poll_interval);
+            tracing::info!(
+                "CAN receive task started on {} (rx_poll_interval={}ms)",
+                can_interface,
+                rx_poll_interval
+            );
 
             #[cfg(feature = "tracing-support")]
             tracing::info!("Creating interval with {}ms period...", rx_poll_interval);
-            
+
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_millis(rx_poll_interval));
 
@@ -172,16 +178,19 @@ impl CanClient {
                         tracing::info!("First tick - waiting for interval...");
                     }
                 }
-                
+
                 interval.tick().await;
-                
+
                 #[cfg(feature = "tracing-support")]
                 {
                     if poll_count == 1 {
                         tracing::info!("First tick completed! Loop is working.");
                     }
                     if poll_count % 20 == 0 {
-                        tracing::debug!("CAN receive loop: {} polls, checking for frames...", poll_count);
+                        tracing::debug!(
+                            "CAN receive loop: {} polls, checking for frames...",
+                            poll_count
+                        );
                     }
                 }
 
@@ -218,10 +227,7 @@ impl CanClient {
                             frame_cache.write().await.update(can_id, data);
                         } else {
                             #[cfg(feature = "tracing-support")]
-                            tracing::warn!(
-                                "Ignoring non-LYNK CAN frame: ID=0x{:03X}",
-                                can_id
-                            );
+                            tracing::warn!("Ignoring non-LYNK CAN frame: ID=0x{:03X}", can_id);
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -232,7 +238,7 @@ impl CanClient {
                     Err(e) => {
                         #[cfg(feature = "tracing-support")]
                         tracing::error!("CAN read error: {:?}", e);
-                        
+
                         *last_error.write().await = Some(format!("CAN read error: {}", e));
                         error_count.fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -254,8 +260,8 @@ impl CanClient {
         let frame_cache = Arc::clone(&self.frame_cache);
         let point_manager = Arc::clone(&self.point_manager);
         let cached_data = Arc::clone(&self.cached_data);
-        let read_count = Arc::new(AtomicU64::new(0));
-        let error_count = Arc::new(AtomicU64::new(0));
+        let read_count = Arc::clone(&self.read_count);
+        let error_count = Arc::clone(&self.error_count);
         let last_error = Arc::clone(&self.last_error);
         let event_sender = self.event_sender.clone();
         let event_handler = self.event_handler.clone();
@@ -277,7 +283,7 @@ impl CanClient {
 
                 // Apply mappings to decode cached frames
                 let cache = frame_cache.read().await;
-                
+
                 #[cfg(feature = "tracing-support")]
                 {
                     tracing::info!("Frame cache has {} CAN IDs", cache.len());
@@ -285,12 +291,12 @@ impl CanClient {
                         tracing::debug!("  CAN ID 0x{:03X}: {} bytes", can_id, data.len());
                     }
                 }
-                
+
                 match point_manager.apply_mappings(&cache) {
                     Ok(decoded_points) => {
                         #[cfg(feature = "tracing-support")]
                         tracing::info!("Decoded {} points from frame cache", decoded_points.len());
-                        
+
                         if decoded_points.is_empty() {
                             #[cfg(feature = "tracing-support")]
                             tracing::warn!("No points decoded from frame cache");
@@ -302,8 +308,14 @@ impl CanClient {
 
                         for (point_id, (value, data_type, quality)) in decoded_points {
                             #[cfg(feature = "tracing-support")]
-                            tracing::debug!("  Point {}: {:?} (type: {:?}, quality: {:?})", point_id, value, data_type, quality);
-                            
+                            tracing::debug!(
+                                "  Point {}: {:?} (type: {:?}, quality: {:?})",
+                                point_id,
+                                value,
+                                data_type,
+                                quality
+                            );
+
                             let data_point = DataPoint {
                                 id: point_id,
                                 data_type,
@@ -323,7 +335,10 @@ impl CanClient {
                             read_count.fetch_add(1, Ordering::Relaxed);
 
                             #[cfg(feature = "tracing-support")]
-                            tracing::info!("Sending batch with {} data points to event system", batch.len());
+                            tracing::info!(
+                                "Sending batch with {} data points to event system",
+                                batch.len()
+                            );
 
                             // Send event
                             if let Some(ref sender) = event_sender {
@@ -465,7 +480,10 @@ impl ProtocolClient for CanClient {
         })?;
 
         #[cfg(feature = "tracing-support")]
-        tracing::info!("CAN interface {} opened successfully", self.config.can_interface);
+        tracing::info!(
+            "CAN interface {} opened successfully",
+            self.config.can_interface
+        );
 
         self.is_connected.store(true, Ordering::SeqCst);
         *self.connection_state.write().await = ConnectionState::Connected;
@@ -514,7 +532,10 @@ impl ProtocolClient for CanClient {
         ))
     }
 
-    async fn write_adjustment(&mut self, _adjustments: &[AdjustmentCommand]) -> Result<WriteResult> {
+    async fn write_adjustment(
+        &mut self,
+        _adjustments: &[AdjustmentCommand],
+    ) -> Result<WriteResult> {
         Err(GatewayError::Unsupported(
             "Write adjustment not supported for CAN protocol".to_string(),
         ))
@@ -545,4 +566,3 @@ impl EventDrivenProtocol for CanClient {
         self.event_handler = Some(handler);
     }
 }
-

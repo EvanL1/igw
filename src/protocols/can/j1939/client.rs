@@ -9,7 +9,7 @@ use std::sync::Arc;
 use socketcan::{CanSocket, EmbeddedFrame, Frame, Socket};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
-use voltage_j1939::{database_stats, decode_frame, extract_pgn, extract_source_address};
+use voltage_j1939::{database_stats, decode_frame, extract_source_address};
 
 use crate::core::data::{DataBatch, DataPoint, DataType, Value};
 use crate::core::error::{GatewayError, Result};
@@ -68,8 +68,8 @@ pub struct J1939Client {
     is_connected: Arc<AtomicBool>,
 
     // Statistics
-    read_count: AtomicU64,
-    error_count: AtomicU64,
+    read_count: Arc<AtomicU64>,
+    error_count: Arc<AtomicU64>,
     last_error: Arc<RwLock<Option<String>>>,
 
     // Tasks
@@ -90,8 +90,8 @@ impl J1939Client {
             config,
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             is_connected: Arc::new(AtomicBool::new(false)),
-            read_count: AtomicU64::new(0),
-            error_count: AtomicU64::new(0),
+            read_count: Arc::new(AtomicU64::new(0)),
+            error_count: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(RwLock::new(None)),
             receive_handle: None,
             event_sender: None,
@@ -106,8 +106,8 @@ impl J1939Client {
         let source_address = self.config.source_address;
         let is_connected = Arc::clone(&self.is_connected);
         let cached_data = Arc::clone(&self.cached_data);
-        let read_count = self.read_count.clone();
-        let error_count = self.error_count.clone();
+        let read_count = Arc::clone(&self.read_count);
+        let error_count = Arc::clone(&self.error_count);
         let last_error = Arc::clone(&self.last_error);
         let event_sender = self.event_sender.clone();
         let event_handler = self.event_handler.clone();
@@ -154,9 +154,10 @@ impl J1939Client {
                                     value: Value::Float(decoded.value),
                                     quality: Quality::Good,
                                     timestamp,
+                                    source_timestamp: None,
                                 };
 
-                                batch.push(data_point.clone());
+                                batch.add(data_point.clone());
 
                                 // Update cache
                                 cached_data
@@ -234,20 +235,20 @@ impl Protocol for J1939Client {
             (None, None) => {
                 // Return all cached data
                 for point in cached.values() {
-                    batch.push(point.clone());
+                    batch.add(point.clone());
                 }
             }
             (Some(DataType::Telemetry), None) => {
                 for point in cached.values() {
                     if point.data_type == DataType::Telemetry {
-                        batch.push(point.clone());
+                        batch.add(point.clone());
                     }
                 }
             }
             (None, Some(ids)) => {
                 for id in ids {
                     if let Some(point) = cached.get(id) {
-                        batch.push(point.clone());
+                        batch.add(point.clone());
                     }
                 }
             }
@@ -255,7 +256,7 @@ impl Protocol for J1939Client {
                 for id in ids {
                     if let Some(point) = cached.get(id) {
                         if point.data_type == *dtype {
-                            batch.push(point.clone());
+                            batch.add(point.clone());
                         }
                     }
                 }
@@ -345,7 +346,7 @@ impl ProtocolClient for J1939Client {
 
     async fn write_control(&mut self, _commands: &[ControlCommand]) -> Result<WriteResult> {
         // J1939 control requires proprietary PGN support
-        Err(GatewayError::NotSupported(
+        Err(GatewayError::Unsupported(
             "J1939 control commands require proprietary PGN implementation".to_string(),
         ))
     }
@@ -355,7 +356,7 @@ impl ProtocolClient for J1939Client {
         _adjustments: &[AdjustmentCommand],
     ) -> Result<WriteResult> {
         // J1939 adjustment requires proprietary PGN support
-        Err(GatewayError::NotSupported(
+        Err(GatewayError::Unsupported(
             "J1939 adjustment commands require proprietary PGN implementation".to_string(),
         ))
     }
@@ -392,7 +393,7 @@ impl EventDrivenProtocol for J1939Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voltage_j1939::{extract_pgn, parse_can_id};
+    use voltage_j1939::parse_can_id;
 
     #[test]
     fn test_parse_can_id() {

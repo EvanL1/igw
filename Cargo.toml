@@ -1,6 +1,6 @@
 [package]
 name = "igw"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2021"
 rust-version = "1.85"
 description = "Industrial Gateway - Universal SCADA Protocol Library for Rust"
@@ -23,8 +23,8 @@ modbus = ["modbus-tcp"]  # Backward compatible alias
 modbus-tcp = ["dep:voltage_modbus", "tracing-support"]
 modbus-rtu = ["modbus-tcp", "voltage_modbus/rtu"]
 iec104 = ["dep:voltage_iec104"]
-j1939 = ["dep:socketcan", "dep:voltage_j1939"]
 can = ["dep:socketcan", "tracing-support"]  # LYNK CAN protocol
+j1939 = ["can", "dep:voltage_j1939"]  # J1939 is a CAN-based protocol
 opcua = ["dep:async-opcua"]
 
 # Virtual channel (no external deps)

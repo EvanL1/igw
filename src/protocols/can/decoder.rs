@@ -215,12 +215,7 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<(Value, DataType)
                     raw_bytes.len()
                 )));
             }
-            let raw = u32::from_le_bytes([
-                raw_bytes[0],
-                raw_bytes[1],
-                raw_bytes[2],
-                raw_bytes[3],
-            ]);
+            let raw = u32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]);
             (Value::Integer(raw as i64), DataType::Telemetry)
         }
         "int32" => {
@@ -230,12 +225,7 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<(Value, DataType)
                     raw_bytes.len()
                 )));
             }
-            let raw = i32::from_le_bytes([
-                raw_bytes[0],
-                raw_bytes[1],
-                raw_bytes[2],
-                raw_bytes[3],
-            ]);
+            let raw = i32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]);
             (Value::Integer(raw as i64), DataType::Telemetry)
         }
         "int" => {
@@ -271,4 +261,3 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<(Value, DataType)
 
     Ok((final_value, data_type))
 }
-

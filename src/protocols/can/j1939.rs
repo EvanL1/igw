@@ -21,7 +21,7 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use igw::protocols::j1939::{J1939Client, J1939Config};
+//! use igw::protocols::can::j1939::{J1939Client, J1939Config};
 //!
 //! let config = J1939Config {
 //!     can_interface: "can0".to_string(),
