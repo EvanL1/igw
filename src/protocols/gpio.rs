@@ -291,57 +291,11 @@ impl SysfsDriver {
             base_path: base_path.into(),
         }
     }
-
-    /// Get the path for a GPIO's direction file.
-    fn direction_path(&self, gpio_num: u32) -> std::path::PathBuf {
-        std::path::PathBuf::from(&self.base_path)
-            .join(format!("gpio{}", gpio_num))
-            .join("direction")
-    }
-
     /// Get the path for a GPIO's value file.
     fn value_path(&self, gpio_num: u32) -> std::path::PathBuf {
         std::path::PathBuf::from(&self.base_path)
             .join(format!("gpio{}", gpio_num))
             .join("value")
-    }
-
-    /// Export a GPIO if not already exported.
-    async fn ensure_exported(&self, gpio_num: u32) -> Result<()> {
-        let gpio_path = std::path::PathBuf::from(&self.base_path).join(format!("gpio{}", gpio_num));
-
-        if !gpio_path.exists() {
-            let export_path = std::path::PathBuf::from(&self.base_path).join("export");
-            tokio::fs::write(&export_path, gpio_num.to_string())
-                .await
-                .map_err(|e| {
-                    GatewayError::Protocol(format!("Failed to export GPIO {}: {}", gpio_num, e))
-                })?;
-
-            // Wait for sysfs to create the GPIO directory
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        Ok(())
-    }
-
-    /// Set GPIO direction.
-    async fn set_direction(&self, gpio_num: u32, direction: GpioDirection) -> Result<()> {
-        let dir_str = match direction {
-            GpioDirection::Input => "in",
-            GpioDirection::Output => "out",
-        };
-
-        tokio::fs::write(self.direction_path(gpio_num), dir_str)
-            .await
-            .map_err(|e| {
-                GatewayError::Protocol(format!(
-                    "Failed to set GPIO {} direction to {}: {}",
-                    gpio_num, dir_str, e
-                ))
-            })?;
-
-        Ok(())
     }
 }
 
@@ -414,11 +368,7 @@ impl GpioDriver for SysfsDriver {
             ))
         })?;
 
-        // Ensure GPIO is exported and set as input
-        self.ensure_exported(gpio_num).await?;
-        self.set_direction(gpio_num, GpioDirection::Input).await?;
-
-        // Read value
+        // Read value (GPIO should already be exported and configured by OS/device tree)
         let value_str = tokio::fs::read_to_string(self.value_path(gpio_num))
             .await
             .map_err(|e| {
@@ -437,11 +387,7 @@ impl GpioDriver for SysfsDriver {
             ))
         })?;
 
-        // Ensure GPIO is exported and set as output
-        self.ensure_exported(gpio_num).await?;
-        self.set_direction(gpio_num, GpioDirection::Output).await?;
-
-        // Write value
+        // Write value (GPIO should already be exported and configured by OS/device tree)
         let value_str = if value { "1" } else { "0" };
         tokio::fs::write(self.value_path(gpio_num), value_str)
             .await
