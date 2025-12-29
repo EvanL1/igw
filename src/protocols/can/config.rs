@@ -57,6 +57,136 @@ fn default_scale() -> f64 {
     1.0
 }
 
+// ============================================================================
+// Strongly-typed mapping configs for JSON deserialization
+// ============================================================================
+
+/// CAN point mapping configuration (deserialized from protocol_mappings JSON).
+///
+/// # Required Fields
+/// - `can_id`: The CAN frame ID. This field is **required** and
+///   deserialization will fail if missing.
+///
+/// # Optional Fields
+/// - `byte_offset`: Byte offset in CAN data field (default: 0)
+/// - `bit_position`: Bit position within byte (default: 0)
+/// - `bit_length`: Number of bits to read (default: 16)
+/// - `data_type`: Data type interpretation (default: "uint16")
+///
+/// # Example JSON
+/// ```json
+/// {
+///     "can_id": 849,
+///     "byte_offset": 0,
+///     "bit_position": 0,
+///     "bit_length": 16,
+///     "data_type": "uint16"
+/// }
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct CanMappingConfig {
+    /// CAN frame ID (e.g., 0x351 or 849). **Required field**.
+    pub can_id: u32,
+
+    /// Byte offset in CAN data field (0-7).
+    #[serde(default)]
+    pub byte_offset: u8,
+
+    /// Bit starting position within byte (0-7, LSB=0).
+    #[serde(default)]
+    pub bit_position: u8,
+
+    /// Bit length (1/2/8/16/32/64).
+    #[serde(default = "default_bit_length")]
+    pub bit_length: u8,
+
+    /// Data type string (uint8, uint16, int16, uint32, int32, float32, ascii).
+    #[serde(default = "default_data_type")]
+    pub data_type: String,
+}
+
+fn default_bit_length() -> u8 {
+    16
+}
+
+fn default_data_type() -> String {
+    "uint16".to_string()
+}
+
+impl CanMappingConfig {
+    /// Convert to CanPoint.
+    pub fn to_can_point(&self, point_id: u32, scale: f64, offset: f64) -> CanPoint {
+        CanPoint {
+            point_id,
+            can_id: self.can_id,
+            byte_offset: self.byte_offset,
+            bit_position: self.bit_position,
+            bit_length: self.bit_length,
+            data_type: self.data_type.clone(),
+            scale,
+            offset,
+        }
+    }
+}
+
+/// CAN channel parameters configuration (deserialized from parameters_json).
+///
+/// # Example JSON
+/// ```json
+/// {
+///     "interface": "can0",
+///     "bitrate": 250000,
+///     "rx_poll_interval_ms": 50,
+///     "data_read_interval_ms": 1000
+/// }
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct CanChannelParamsConfig {
+    /// CAN interface name (e.g., "can0").
+    #[serde(default = "default_can_interface")]
+    pub interface: String,
+
+    /// CAN bitrate in bits per second.
+    #[serde(default = "default_bitrate")]
+    pub bitrate: u32,
+
+    /// RX polling interval in milliseconds.
+    #[serde(default = "default_rx_poll_interval")]
+    pub rx_poll_interval_ms: u64,
+
+    /// Data reading interval in milliseconds.
+    #[serde(default = "default_data_read_interval")]
+    pub data_read_interval_ms: u64,
+}
+
+fn default_can_interface() -> String {
+    "can0".to_string()
+}
+
+fn default_bitrate() -> u32 {
+    250000
+}
+
+fn default_rx_poll_interval() -> u64 {
+    50
+}
+
+fn default_data_read_interval() -> u64 {
+    1000
+}
+
+impl CanChannelParamsConfig {
+    /// Convert to CanConfig.
+    pub fn to_can_config(&self) -> CanConfig {
+        CanConfig {
+            can_interface: self.interface.clone(),
+            bitrate: self.bitrate,
+            rx_poll_interval_ms: self.rx_poll_interval_ms,
+            data_read_interval_ms: self.data_read_interval_ms,
+        }
+    }
+}
+
 /// CAN frame cache - stores the latest received frame for each CAN-ID
 #[derive(Debug, Clone, Default)]
 pub struct CanFrameCache {

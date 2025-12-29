@@ -62,6 +62,10 @@ use tokio::sync::RwLock;
 
 use tokio_gpiod::{Chip, Options};
 
+use serde::Deserialize;
+#[cfg(feature = "tracing-support")]
+use tracing::{info, warn};
+
 use crate::core::data::{DataBatch, DataPoint};
 use crate::core::error::{GatewayError, Result};
 use crate::core::logging::{
@@ -70,8 +74,7 @@ use crate::core::logging::{
 use crate::core::metadata::{DriverMetadata, HasMetadata, ParameterMetadata, ParameterType};
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, Diagnostics,
-    PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
-    WriteResult,
+    PointFailure, PollResult, Protocol, ProtocolCapabilities, ProtocolClient, WriteResult,
 };
 
 // ============================================================================
@@ -98,6 +101,124 @@ pub enum GpioDriverType {
 impl Default for GpioDriverType {
     fn default() -> Self {
         Self::Gpiod
+    }
+}
+
+// ============================================================================
+// Strongly-typed mapping configs for JSON deserialization
+// ============================================================================
+
+/// GPIO point mapping configuration (deserialized from protocol_mappings JSON).
+///
+/// # Required Fields
+/// - `gpio_number`: The GPIO pin number. This field is **required** and
+///   deserialization will fail if missing.
+///
+/// # Optional Fields
+/// - `gpio_chip`: GPIO chip name (default: "gpiochip0")
+/// - `active_low`: Invert the logic level (default: false)
+/// - `debounce_us`: Debounce time in microseconds (default: 0)
+///
+/// # Example JSON
+/// ```json
+/// {
+///     "gpio_number": 496,
+///     "gpio_chip": "gpiochip0",
+///     "active_low": false
+/// }
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct GpioMappingConfig {
+    /// GPIO pin number (sysfs number or chip offset). **Required field**.
+    pub gpio_number: u32,
+
+    /// GPIO chip name (default: "gpiochip0").
+    #[serde(default = "default_gpio_chip")]
+    pub gpio_chip: String,
+
+    /// Active low - invert the logic level.
+    #[serde(default)]
+    pub active_low: bool,
+
+    /// Debounce time in microseconds.
+    #[serde(default)]
+    pub debounce_us: u64,
+}
+
+fn default_gpio_chip() -> String {
+    "gpiochip0".to_string()
+}
+
+impl GpioMappingConfig {
+    /// Convert to igw GpioPinConfig for input (DI).
+    pub fn to_input_pin_config(&self, point_id: u32) -> GpioPinConfig {
+        GpioPinConfig::digital_input(&self.gpio_chip, self.gpio_number, point_id)
+            .with_active_low(self.active_low)
+            .with_debounce(self.debounce_us)
+    }
+
+    /// Convert to igw GpioPinConfig for output (DO).
+    pub fn to_output_pin_config(&self, point_id: u32) -> GpioPinConfig {
+        GpioPinConfig::digital_output(&self.gpio_chip, self.gpio_number, point_id)
+            .with_active_low(self.active_low)
+    }
+}
+
+/// GPIO channel parameters configuration (deserialized from parameters_json).
+///
+/// # Example JSON
+/// ```json
+/// {
+///     "driver": "gpiod",
+///     "gpio_chip": "gpiochip0",
+///     "poll_interval_ms": 200
+/// }
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct GpioChannelParamsConfig {
+    /// Driver type: "gpiod" or "sysfs".
+    #[serde(default = "default_driver")]
+    pub driver: String,
+
+    /// Sysfs base path (only for sysfs driver).
+    #[serde(default = "default_sysfs_path")]
+    pub sysfs_base_path: String,
+
+    /// Poll interval in milliseconds.
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_ms: u64,
+}
+
+fn default_driver() -> String {
+    "gpiod".to_string()
+}
+
+fn default_sysfs_path() -> String {
+    "/sys/class/gpio".to_string()
+}
+
+fn default_poll_interval() -> u64 {
+    200
+}
+
+impl GpioChannelParamsConfig {
+    /// Get the GPIO driver type from configuration.
+    pub fn driver_type(&self) -> GpioDriverType {
+        match self.driver.to_lowercase().as_str() {
+            "sysfs" => GpioDriverType::Sysfs {
+                base_path: self.sysfs_base_path.clone(),
+            },
+            _ => GpioDriverType::Gpiod,
+        }
+    }
+
+    /// Convert to GpioChannelConfig.
+    pub fn to_config(&self) -> GpioChannelConfig {
+        GpioChannelConfig {
+            driver: self.driver_type(),
+            pins: Vec::new(), // Pins are added via point configs
+            poll_interval: std::time::Duration::from_millis(self.poll_interval_ms),
+        }
     }
 }
 
@@ -700,7 +821,7 @@ impl GpioChannel {
         } else {
             raw_value
         };
-        Ok(DataPoint::signal(pin_config.point_id, adjusted))
+        Ok(DataPoint::new(pin_config.point_id, adjusted))
     }
 
     /// Write to a single GPIO pin using the configured driver.
@@ -747,34 +868,21 @@ impl LoggableProtocol for GpioChannel {
     }
 }
 
-impl Protocol for GpioChannel {
-    fn connection_state(&self) -> ConnectionState {
-        self.get_state()
-    }
-
-    async fn read(&self, request: ReadRequest) -> Result<ReadResponse> {
-        if !self.get_state().is_connected() {
-            return Err(GatewayError::NotConnected);
-        }
-
+// Helper methods for GpioChannel
+impl GpioChannel {
+    /// Read all GPIO pins and return batch with failures.
+    ///
+    /// This method reads all input pins and output states, collecting any failures.
+    async fn read_all(&self) -> (DataBatch, Vec<PointFailure>) {
         let mut batch = DataBatch::new();
-        let mut errors = Vec::new(); // Collect partial read errors
+        let mut failures = Vec::new();
 
         // Read all input pins
         for pin in self.config.input_pins() {
-            // Filter by request
-            if let Some(ref ids) = request.point_ids {
-                if !ids.contains(&pin.point_id) {
-                    continue;
-                }
-            }
-
             match self.read_pin(pin).await {
                 Ok(point) => batch.add(point),
                 Err(e) => {
-                    // Record error with point_id for transparency
-                    errors.push((pin.point_id, e.to_string()));
-                    // Also update diagnostics for backward compatibility
+                    failures.push(PointFailure::new(pin.point_id, e.to_string()));
                     let mut diag = self.diagnostics.write().await;
                     diag.error_count += 1;
                     diag.last_error = Some(e.to_string());
@@ -784,14 +892,8 @@ impl Protocol for GpioChannel {
 
         // Also include output states as feedback
         for pin in self.config.output_pins() {
-            if let Some(ref ids) = request.point_ids {
-                if !ids.contains(&pin.point_id) {
-                    continue;
-                }
-            }
-
             if let Some(state) = self.read_output_state(pin.point_id).await {
-                batch.add(DataPoint::control(pin.point_id, state));
+                batch.add(DataPoint::new(pin.point_id, state));
             }
         }
 
@@ -800,8 +902,13 @@ impl Protocol for GpioChannel {
             diag.read_count += 1;
         }
 
-        // Return response with error details
-        Ok(ReadResponse::with_errors(batch, errors))
+        (batch, failures)
+    }
+}
+
+impl Protocol for GpioChannel {
+    fn connection_state(&self) -> ConnectionState {
+        self.get_state()
     }
 
     async fn diagnostics(&self) -> Result<Diagnostics> {
@@ -844,26 +951,22 @@ impl ProtocolClient for GpioChannel {
         Ok(())
     }
 
-    async fn poll_once(&mut self) -> Result<DataBatch> {
+    async fn poll_once(&mut self) -> PollResult {
         let start = Instant::now();
-        let response = self.read(ReadRequest::all()).await?;
+        let (batch, failures) = self.read_all().await;
 
         // Log error summary (avoids log flooding with many failed pins)
-        if let Some((count, first_errors)) = response.error_summary() {
-            let error_msg = if first_errors.is_empty() {
-                format!("GPIO read: {} point(s) failed", count)
-            } else {
-                format!(
-                    "GPIO read: {} point(s) failed, first errors: {:?}",
-                    count, first_errors
-                )
-            };
+        if !failures.is_empty() {
+            let first_errors: Vec<_> = failures.iter().take(3).collect();
+            let error_msg = format!(
+                "GPIO read: {} point(s) failed, first errors: {:?}",
+                failures.len(),
+                first_errors
+            );
             self.log_ctx
                 .log_error(error_msg, ErrorContext::Polling)
                 .await;
         }
-
-        let batch = response.data;
 
         // Log poll cycle with actual error count
         self.log_ctx
@@ -871,11 +974,15 @@ impl ProtocolClient for GpioChannel {
                 batch.clone(),
                 start.elapsed().as_millis() as u64,
                 batch.len(),
-                response.failed_count,
+                failures.len(),
             )
             .await;
 
-        Ok(batch)
+        if failures.is_empty() {
+            PollResult::success(batch)
+        } else {
+            PollResult::partial(batch, failures)
+        }
     }
 
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
@@ -937,20 +1044,6 @@ impl ProtocolClient for GpioChannel {
         Err(GatewayError::Unsupported(
             "GPIO does not support analog adjustment".into(),
         ))
-    }
-
-    async fn start_polling(&mut self, _config: PollingConfig) -> Result<()> {
-        // Note: Polling is stub implementation.
-        // In production, the service layer (comsrv) handles the polling loop
-        // and is responsible for persisting data from read() calls.
-        Ok(())
-    }
-
-    async fn stop_polling(&mut self) -> Result<()> {
-        if let Some(task) = self.poll_task.take() {
-            task.abort();
-        }
-        Ok(())
     }
 }
 

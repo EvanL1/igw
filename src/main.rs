@@ -1,85 +1,182 @@
 //! IGW CLI Entry Point
 //!
-//! Industrial Gateway command-line interface.
+//! 工具命令行界面，提供协议查询和示例配置生成。
+//!
+//! 要运行完整的网关，请使用 `examples/gateway_demo.rs`：
+//! ```bash
+//! cargo run --example gateway_demo --features full -- config.toml
+//! ```
 
-use clap::Parser;
-use std::path::PathBuf;
+use clap::{Parser, Subcommand};
+
+use igw::core::metadata::get_protocol_registry;
 
 /// Industrial Gateway - Universal SCADA Protocol Gateway
 #[derive(Parser, Debug)]
 #[command(name = "igw", version, about, long_about = None)]
-struct Args {
-    /// Configuration file path
-    #[arg(short, long, default_value = "config.toml")]
-    config: PathBuf,
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// Verbose output
-    #[arg(short, long)]
-    verbose: bool,
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// List supported protocols
+    ListProtocols,
+
+    /// Generate example configuration
+    Example {
+        /// Protocol to generate example for
+        #[arg(default_value = "modbus")]
+        protocol: String,
+    },
 }
 
 fn main() {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    if args.verbose {
-        println!("IGW v{}", env!("CARGO_PKG_VERSION"));
-        println!("Config: {:?}", args.config);
+    match cli.command {
+        Commands::ListProtocols => {
+            list_protocols();
+        }
+        Commands::Example { protocol } => {
+            generate_example(&protocol);
+        }
     }
-
-    run_headless(&args);
 }
 
-fn run_headless(args: &Args) {
-    println!("IGW Headless Mode");
-    println!("Config: {:?}", args.config);
+fn list_protocols() {
+    let registry = get_protocol_registry();
 
-    // TODO: Load config and start gateway
-    if !args.config.exists() {
-        eprintln!("Warning: Config file not found: {:?}", args.config);
-        eprintln!("Creating example config...");
-        create_example_config(&args.config);
+    println!("Supported protocols:");
+    println!();
+
+    for protocol in registry.protocols() {
+        println!("  {} ({})", protocol.name, protocol.display_name);
+        println!("    {}", protocol.description);
+        if !protocol.drivers.is_empty() {
+            println!("    Drivers:");
+            for driver in &protocol.drivers {
+                let rec = if driver.is_recommended {
+                    " (recommended)"
+                } else {
+                    ""
+                };
+                println!("      - {}{}", driver.name, rec);
+            }
+        }
+        println!();
     }
 
-    // Start runtime
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-    rt.block_on(async {
-        println!("Gateway started. Press Ctrl+C to stop.");
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for ctrl+c");
-        println!("Shutting down...");
-    });
+    println!("For a complete gateway demo, run:");
+    println!("  cargo run --example gateway_demo --features full -- <config.toml>");
 }
 
-fn create_example_config(path: &PathBuf) {
-    let example = r#"# IGW Configuration Example
+fn generate_example(protocol: &str) {
+    let example = match protocol.to_lowercase().as_str() {
+        "modbus" => {
+            r#"# IGW Configuration - Modbus Example
 
 [gateway]
-name = "Industrial Gateway"
+name = "Modbus Gateway"
+default_poll_interval_ms = 1000
+diagnostics_interval_ms = 30000
 
-# Modbus TCP Channel Example
-# [[channels]]
-# id = 1
-# name = "Modbus PLC"
-# protocol = "modbus-tcp"
-# address = "192.168.1.100:502"
-#
-# [[channels.points]]
-# id = "temperature"
-# data_type = "telemetry"
-# address = { slave_id = 1, function_code = 3, register = 100 }
+[[channels]]
+id = 1
+name = "PLC1"
+protocol = "modbus"
+enabled = true
 
-# IEC 104 Channel Example
-# [[channels]]
-# id = 2
-# name = "IEC 104 RTU"
-# protocol = "iec104"
-# address = "192.168.1.200:2404"
-"#;
+[channels.parameters]
+host = "192.168.1.100"
+port = 502
+connect_timeout_ms = 5000
+io_timeout_ms = 3000
 
-    if let Err(e) = std::fs::write(path, example) {
-        eprintln!("Failed to create config: {}", e);
-    } else {
-        println!("Example config created: {:?}", path);
-    }
+[[channels.points]]
+id = 1001
+name = "Temperature"
+address = "1:100"  # slave_id:register
+
+[channels.points.transform]
+scale = 0.1
+
+[[channels.points]]
+id = 1002
+name = "Pressure"
+address = "1:101"
+
+[channels.points.transform]
+scale = 0.01
+offset = 0.0
+"#
+        }
+        "iec104" => {
+            r#"# IGW Configuration - IEC 104 Example
+
+[gateway]
+name = "IEC104 Gateway"
+default_poll_interval_ms = 1000
+diagnostics_interval_ms = 30000
+
+[[channels]]
+id = 1
+name = "RTU1"
+protocol = "iec104"
+enabled = true
+
+[channels.parameters]
+address = "192.168.1.200:2404"
+common_address = 1
+connect_timeout_ms = 10000
+
+[[channels.points]]
+id = 2001
+name = "Voltage_A"
+address = "1001"  # IOA
+
+[[channels.points]]
+id = 2002
+name = "Current_A"
+address = "1002"
+"#
+        }
+        "virtual" => {
+            r#"# IGW Configuration - Virtual Channel Example
+
+[gateway]
+name = "Virtual Gateway"
+default_poll_interval_ms = 1000
+diagnostics_interval_ms = 30000
+
+[[channels]]
+id = 1
+name = "DataHub"
+protocol = "virtual"
+enabled = true
+
+[channels.parameters]
+name = "data_hub"
+buffer_size = 2048
+
+[[channels.points]]
+id = 1001
+name = "SimulatedTemp"
+address = "temperature"
+
+[[channels.points]]
+id = 1002
+name = "SimulatedPressure"
+address = "pressure"
+"#
+        }
+        _ => {
+            eprintln!("Unknown protocol: {}", protocol);
+            eprintln!("Available: modbus, iec104, virtual");
+            return;
+        }
+    };
+
+    println!("{}", example);
 }

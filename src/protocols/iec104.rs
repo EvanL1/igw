@@ -34,18 +34,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, RwLock};
 use voltage_iec104::{ClientConfig, Cp56Time2a, Iec104Client, Iec104Event};
 
-use crate::core::data::{DataBatch, DataPoint, DataType, Value};
+use crate::core::data::{DataBatch, DataPoint, Value};
 use crate::core::error::{GatewayError, Result};
 use crate::core::point::PointConfig;
 use crate::core::quality::Quality;
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
     DataEventHandler, DataEventReceiver, DataEventSender, Diagnostics, EventDrivenProtocol,
-    PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
-    WriteResult,
+    PollResult, Protocol, ProtocolCapabilities, ProtocolClient, WriteResult,
 };
 
 /// IEC 104 channel configuration.
@@ -154,6 +153,80 @@ impl Iec104ChannelConfig {
     }
 }
 
+/// IEC 104 channel parameters for JSON configuration.
+///
+/// This is a serde-friendly version of the configuration that can be
+/// deserialized from JSON and converted to `Iec104ChannelConfig`.
+///
+/// # Example JSON
+///
+/// ```json
+/// {
+///     "address": "192.168.1.100:2404",
+///     "common_address": 1,
+///     "connect_timeout_ms": 10000
+/// }
+/// ```
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Iec104ParamsConfig {
+    /// Target address (e.g., "192.168.1.100:2404")
+    pub address: String,
+
+    /// Common address of ASDU (station address)
+    #[serde(default = "default_common_address")]
+    pub common_address: u16,
+
+    /// Connection timeout in milliseconds
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+
+    /// T1 timeout in seconds
+    #[serde(default = "default_t1_timeout")]
+    pub t1_timeout_s: u64,
+
+    /// T2 timeout in seconds
+    #[serde(default = "default_t2_timeout")]
+    pub t2_timeout_s: u64,
+
+    /// T3 timeout in seconds
+    #[serde(default = "default_t3_timeout")]
+    pub t3_timeout_s: u64,
+}
+
+fn default_common_address() -> u16 {
+    1
+}
+
+fn default_connect_timeout_ms() -> u64 {
+    10000
+}
+
+fn default_t1_timeout() -> u64 {
+    15
+}
+
+fn default_t2_timeout() -> u64 {
+    10
+}
+
+fn default_t3_timeout() -> u64 {
+    20
+}
+
+impl Iec104ParamsConfig {
+    /// Convert to Iec104ChannelConfig.
+    ///
+    /// Note: Points must be set separately via `with_points()`.
+    pub fn to_config(&self) -> Iec104ChannelConfig {
+        Iec104ChannelConfig::new(&self.address)
+            .with_common_address(self.common_address)
+            .with_connect_timeout(Duration::from_millis(self.connect_timeout_ms))
+            .with_t1_timeout(Duration::from_secs(self.t1_timeout_s))
+            .with_t2_timeout(Duration::from_secs(self.t2_timeout_s))
+            .with_t3_timeout(Duration::from_secs(self.t3_timeout_s))
+    }
+}
+
 /// IEC 104 channel adapter.
 ///
 /// This struct wraps a `voltage_iec104::Iec104Client` and implements
@@ -166,9 +239,8 @@ pub struct Iec104Channel {
     client: Iec104Client,
     state: Arc<std::sync::RwLock<ConnectionState>>,
     diagnostics: Arc<RwLock<ChannelDiagnostics>>,
+    /// Broadcast sender for event-driven subscribers (multiple subscribers supported).
     event_tx: DataEventSender,
-    #[allow(dead_code)] // Reserved for future use in subscribe()
-    event_rx: Option<DataEventReceiver>,
     event_handler: Option<Arc<dyn DataEventHandler>>,
     poll_task: Option<tokio::task::JoinHandle<()>>,
     /// Point ID -> index lookup for O(1) access
@@ -189,7 +261,8 @@ impl Iec104Channel {
     pub fn new(config: Iec104ChannelConfig) -> Self {
         let client_config = config.to_client_config();
         let client = Iec104Client::new(client_config);
-        let (event_tx, event_rx) = mpsc::channel(1024);
+        // Use broadcast channel for multiple subscribers
+        let (event_tx, _) = broadcast::channel(1024);
 
         // Build point ID -> index mapping for O(1) lookup
         let point_index: HashMap<u32, usize> = config
@@ -205,7 +278,6 @@ impl Iec104Channel {
             state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
             diagnostics: Arc::new(RwLock::new(ChannelDiagnostics::default())),
             event_tx,
-            event_rx: Some(event_rx),
             event_handler: None,
             poll_task: None,
             point_index,
@@ -296,15 +368,13 @@ impl Iec104Channel {
                 self.set_state(ConnectionState::Connected);
                 let _ = self
                     .event_tx
-                    .send(DataEvent::ConnectionChanged(ConnectionState::Connected))
-                    .await;
+                    .send(DataEvent::ConnectionChanged(ConnectionState::Connected));
             }
             Iec104Event::Disconnected => {
                 self.set_state(ConnectionState::Disconnected);
                 let _ = self
                     .event_tx
-                    .send(DataEvent::ConnectionChanged(ConnectionState::Disconnected))
-                    .await;
+                    .send(DataEvent::ConnectionChanged(ConnectionState::Disconnected));
             }
             Iec104Event::DataTransferStarted => {
                 // Data transfer is active
@@ -316,7 +386,7 @@ impl Iec104Channel {
                 let batch = self.convert_data_points(points).await;
                 if !batch.is_empty() {
                     // Send event (service layer handles storage)
-                    let _ = self.event_tx.send(DataEvent::DataUpdate(batch)).await;
+                    let _ = self.event_tx.send(DataEvent::DataUpdate(batch));
 
                     // Update diagnostics
                     let mut diag = self.diagnostics.write().await;
@@ -341,7 +411,7 @@ impl Iec104Channel {
             }
             Iec104Event::Error(msg) => {
                 self.record_error(&msg).await;
-                let _ = self.event_tx.send(DataEvent::Error(msg)).await;
+                let _ = self.event_tx.send(DataEvent::Error(msg));
             }
         }
     }
@@ -365,19 +435,11 @@ impl Iec104Channel {
             // Convert quality
             let quality = convert_iec104_quality(&point.quality);
 
-            // Determine data type based on value
-            let data_type = if point.value.is_boolean() {
-                DataType::Signal
-            } else {
-                DataType::Telemetry
-            };
-
             // Convert source timestamp
             let source_timestamp = point.timestamp.as_ref().and_then(cp56time2a_to_datetime);
 
             let dp = DataPoint {
                 id: point_id,
-                data_type,
                 value,
                 quality,
                 timestamp: Utc::now(),
@@ -422,14 +484,6 @@ impl ProtocolCapabilities for Iec104Channel {
 impl Protocol for Iec104Channel {
     fn connection_state(&self) -> ConnectionState {
         self.get_state()
-    }
-
-    async fn read(&self, _request: ReadRequest) -> Result<ReadResponse> {
-        // IEC 104 is event-driven, not polling-based
-        // Return current values from store
-        Err(GatewayError::Unsupported(
-            "IEC 104 is event-driven; use subscribe() or general_interrogation()".into(),
-        ))
     }
 
     async fn diagnostics(&self) -> Result<Diagnostics> {
@@ -489,13 +543,17 @@ impl ProtocolClient for Iec104Channel {
         }
     }
 
-    async fn poll_once(&mut self) -> Result<DataBatch> {
+    async fn poll_once(&mut self) -> PollResult {
         // IEC 104 is event-driven, so poll_once fetches any pending events
         // from the underlying client and converts them to a DataBatch.
-        let event = self.client.poll().await.map_err(|e| {
-            self.diagnostics.blocking_write().error_count += 1;
-            GatewayError::Protocol(e.to_string())
-        })?;
+        let event = match self.client.poll().await {
+            Ok(ev) => ev,
+            Err(_e) => {
+                self.diagnostics.blocking_write().error_count += 1;
+                // Return empty result with no failure tracking (connection-level error)
+                return PollResult::success(DataBatch::new());
+            }
+        };
 
         let mut batch = DataBatch::new();
         if let Some(voltage_iec104::Iec104Event::DataUpdate(points)) = event {
@@ -510,7 +568,7 @@ impl ProtocolClient for Iec104Channel {
             diag.recv_count += 1;
         }
 
-        Ok(batch)
+        PollResult::success(batch)
     }
 
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
@@ -627,44 +685,32 @@ impl ProtocolClient for Iec104Channel {
             failures,
         })
     }
-
-    async fn start_polling(&mut self, config: PollingConfig) -> Result<()> {
-        // For IEC 104, "polling" means starting a background task that calls poll()
-        // and optionally sends periodic general interrogations
-
-        let _interval = Duration::from_millis(config.interval_ms);
-
-        // Start data transfer first
-        self.start_data_transfer().await?;
-
-        // Send initial general interrogation
-        self.general_interrogation().await?;
-
-        // TODO: Implement actual poll loop with proper channel cloning or task management
-        // For now, we just indicate that polling has been configured.
-
-        Ok(())
-    }
-
-    async fn stop_polling(&mut self) -> Result<()> {
-        if let Some(task) = self.poll_task.take() {
-            task.abort();
-        }
-        self.stop_data_transfer().await
-    }
 }
 
 impl EventDrivenProtocol for Iec104Channel {
     fn subscribe(&self) -> DataEventReceiver {
-        // Note: This is a stub implementation that creates a new channel.
-        // In a real implementation, we'd need to properly manage subscriptions.
-        // The event_rx stored in the struct should be used instead.
-        let (_tx, rx) = mpsc::channel(1024);
-        rx
+        // Broadcast channel supports multiple subscribers
+        // Each call to subscribe() returns a new receiver that gets all future events
+        self.event_tx.subscribe()
     }
 
     fn set_event_handler(&mut self, handler: Arc<dyn DataEventHandler>) {
         self.event_handler = Some(handler);
+    }
+
+    async fn start(&mut self) -> Result<()> {
+        // For IEC 104, start means starting data transfer and initial GI
+        self.start_data_transfer().await?;
+        self.general_interrogation().await?;
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        // Abort poll task if running
+        if let Some(task) = self.poll_task.take() {
+            task.abort();
+        }
+        self.stop_data_transfer().await
     }
 }
 
@@ -740,6 +786,74 @@ fn convert_iec104_quality(quality: &voltage_iec104::Quality) -> Quality {
         Quality::Invalid
     } else {
         Quality::Uncertain
+    }
+}
+
+// ============================================================================
+// HasMetadata Implementation
+// ============================================================================
+
+use crate::core::metadata::{DriverMetadata, HasMetadata, ParameterMetadata, ParameterType};
+
+impl HasMetadata for Iec104Channel {
+    fn metadata() -> DriverMetadata {
+        DriverMetadata {
+            name: "iec104",
+            display_name: "IEC 60870-5-104",
+            description: "IEC 104 telecontrol protocol over TCP/IP for SCADA systems.",
+            is_recommended: true,
+            example_config: serde_json::json!({
+                "address": "192.168.1.100:2404",
+                "common_address": 1,
+                "connect_timeout_ms": 10000,
+                "t1_timeout_s": 15,
+                "t2_timeout_s": 10,
+                "t3_timeout_s": 20
+            }),
+            parameters: vec![
+                ParameterMetadata::required(
+                    "address",
+                    "Server Address",
+                    "IEC 104 server address in host:port format",
+                    ParameterType::String,
+                ),
+                ParameterMetadata::optional(
+                    "common_address",
+                    "Common Address",
+                    "ASDU common address (station address)",
+                    ParameterType::Integer,
+                    serde_json::json!(1),
+                ),
+                ParameterMetadata::optional(
+                    "connect_timeout_ms",
+                    "Connect Timeout (ms)",
+                    "Connection timeout in milliseconds",
+                    ParameterType::Integer,
+                    serde_json::json!(10000),
+                ),
+                ParameterMetadata::optional(
+                    "t1_timeout_s",
+                    "T1 Timeout (s)",
+                    "Send/receive APDU timeout in seconds",
+                    ParameterType::Integer,
+                    serde_json::json!(15),
+                ),
+                ParameterMetadata::optional(
+                    "t2_timeout_s",
+                    "T2 Timeout (s)",
+                    "No data acknowledgement timeout in seconds",
+                    ParameterType::Integer,
+                    serde_json::json!(10),
+                ),
+                ParameterMetadata::optional(
+                    "t3_timeout_s",
+                    "T3 Timeout (s)",
+                    "Test frame timeout in seconds",
+                    ParameterType::Integer,
+                    serde_json::json!(20),
+                ),
+            ],
+        }
     }
 }
 

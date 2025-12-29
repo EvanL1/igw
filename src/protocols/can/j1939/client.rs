@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use socketcan::{CanSocket, EmbeddedFrame, Frame, Socket};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 use voltage_j1939::{database_stats, decode_frame, extract_source_address};
 
@@ -17,8 +17,7 @@ use crate::core::quality::Quality;
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
     DataEventHandler, DataEventReceiver, DataEventSender, Diagnostics, EventDrivenProtocol,
-    PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
-    WriteResult,
+    PollResult, Protocol, ProtocolCapabilities, ProtocolClient, WriteResult,
 };
 
 // ============================================================================
@@ -75,8 +74,8 @@ pub struct J1939Client {
     // Tasks
     receive_handle: Option<JoinHandle<()>>,
 
-    // Event channel
-    event_sender: Option<DataEventSender>,
+    // Event channel (broadcast for multiple subscribers)
+    event_tx: DataEventSender,
     event_handler: Option<Arc<dyn DataEventHandler>>,
 
     // Cached data (latest values)
@@ -86,6 +85,9 @@ pub struct J1939Client {
 impl J1939Client {
     /// Create a new J1939 client with the given configuration.
     pub fn new(config: J1939Config) -> Self {
+        // Use broadcast channel for multiple subscribers
+        let (event_tx, _) = broadcast::channel(1024);
+
         Self {
             config,
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
@@ -94,7 +96,7 @@ impl J1939Client {
             error_count: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(RwLock::new(None)),
             receive_handle: None,
-            event_sender: None,
+            event_tx,
             event_handler: None,
             cached_data: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -109,7 +111,7 @@ impl J1939Client {
         let read_count = Arc::clone(&self.read_count);
         let error_count = Arc::clone(&self.error_count);
         let last_error = Arc::clone(&self.last_error);
-        let event_sender = self.event_sender.clone();
+        let event_tx = self.event_tx.clone();
         let event_handler = self.event_handler.clone();
 
         let handle = tokio::spawn(async move {
@@ -169,10 +171,8 @@ impl J1939Client {
                             if !batch.is_empty() {
                                 read_count.fetch_add(1, Ordering::Relaxed);
 
-                                // Send event
-                                if let Some(ref sender) = event_sender {
-                                    let _ = sender.send(DataEvent::DataUpdate(batch.clone())).await;
-                                }
+                                // Send event (broadcast is sync)
+                                let _ = event_tx.send(DataEvent::DataUpdate(batch.clone()));
 
                                 // Call handler
                                 if let Some(ref handler) = event_handler {
@@ -226,47 +226,6 @@ impl Protocol for J1939Client {
         *futures::executor::block_on(self.connection_state.read())
     }
 
-    async fn read(&self, request: ReadRequest) -> Result<ReadResponse> {
-        let cached = self.cached_data.read().await;
-
-        let mut batch = DataBatch::new();
-
-        match (&request.data_type, &request.point_ids) {
-            (None, None) => {
-                // Return all cached data
-                for point in cached.values() {
-                    batch.add(point.clone());
-                }
-            }
-            (Some(DataType::Telemetry), None) => {
-                for point in cached.values() {
-                    if point.data_type == DataType::Telemetry {
-                        batch.add(point.clone());
-                    }
-                }
-            }
-            (None, Some(ids)) => {
-                for id in ids {
-                    if let Some(point) = cached.get(id) {
-                        batch.add(point.clone());
-                    }
-                }
-            }
-            (Some(dtype), Some(ids)) => {
-                for id in ids {
-                    if let Some(point) = cached.get(id) {
-                        if point.data_type == *dtype {
-                            batch.add(point.clone());
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        Ok(ReadResponse::success(batch))
-    }
-
     async fn diagnostics(&self) -> Result<Diagnostics> {
         let (spn_count, pgn_count) = database_stats();
 
@@ -305,12 +264,10 @@ impl ProtocolClient for J1939Client {
         // Start receive task
         self.start_receive_task()?;
 
-        // Notify connection change
-        if let Some(ref sender) = self.event_sender {
-            let _ = sender
-                .send(DataEvent::ConnectionChanged(ConnectionState::Connected))
-                .await;
-        }
+        // Notify connection change (broadcast is sync)
+        let _ = self
+            .event_tx
+            .send(DataEvent::ConnectionChanged(ConnectionState::Connected));
         if let Some(ref handler) = self.event_handler {
             handler
                 .on_connection_changed(ConnectionState::Connected)
@@ -329,12 +286,10 @@ impl ProtocolClient for J1939Client {
 
         *self.connection_state.write().await = ConnectionState::Disconnected;
 
-        // Notify connection change
-        if let Some(ref sender) = self.event_sender {
-            let _ = sender
-                .send(DataEvent::ConnectionChanged(ConnectionState::Disconnected))
-                .await;
-        }
+        // Notify connection change (broadcast is sync)
+        let _ = self
+            .event_tx
+            .send(DataEvent::ConnectionChanged(ConnectionState::Disconnected));
         if let Some(ref handler) = self.event_handler {
             handler
                 .on_connection_changed(ConnectionState::Disconnected)
@@ -351,6 +306,16 @@ impl ProtocolClient for J1939Client {
         ))
     }
 
+    async fn poll_once(&mut self) -> PollResult {
+        // J1939 is event-driven, but poll_once returns cached data
+        let cached = self.cached_data.read().await;
+        let mut batch = DataBatch::new();
+        for point in cached.values() {
+            batch.add(point.clone());
+        }
+        PollResult::success(batch)
+    }
+
     async fn write_adjustment(
         &mut self,
         _adjustments: &[AdjustmentCommand],
@@ -360,29 +325,30 @@ impl ProtocolClient for J1939Client {
             "J1939 adjustment commands require proprietary PGN implementation".to_string(),
         ))
     }
-
-    async fn start_polling(&mut self, _config: PollingConfig) -> Result<()> {
-        // J1939 is event-driven, no polling needed
-        Ok(())
-    }
-
-    async fn stop_polling(&mut self) -> Result<()> {
-        Ok(())
-    }
 }
 
 impl EventDrivenProtocol for J1939Client {
     fn subscribe(&self) -> DataEventReceiver {
-        // This is a simplified implementation
-        // In a real implementation, you'd want to support multiple subscribers
-        let (_tx, rx) = mpsc::channel(100);
-        // Note: This overwrites any existing sender, which is not ideal
-        // A proper implementation would use a broadcast channel
-        rx
+        // Broadcast channel supports multiple subscribers
+        self.event_tx.subscribe()
     }
 
     fn set_event_handler(&mut self, handler: Arc<dyn DataEventHandler>) {
         self.event_handler = Some(handler);
+    }
+
+    async fn start(&mut self) -> Result<()> {
+        // For J1939, start is handled in connect() which starts the receive task
+        // This is a no-op since the receive task is already running
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        // Stop the receive task
+        if let Some(handle) = self.receive_handle.take() {
+            handle.abort();
+        }
+        Ok(())
     }
 }
 

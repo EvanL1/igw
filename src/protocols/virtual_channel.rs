@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, RwLock};
 
 use crate::core::data::{DataBatch, DataPoint};
 use crate::core::error::Result;
@@ -37,9 +37,9 @@ use crate::core::point::PointConfig;
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
     DataEventHandler, DataEventReceiver, DataEventSender, Diagnostics, EventDrivenProtocol,
-    PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
-    WriteResult,
+    PollResult, Protocol, ProtocolCapabilities, ProtocolClient, WriteResult,
 };
+use serde::Deserialize;
 
 /// Virtual channel configuration.
 #[derive(Debug, Clone)]
@@ -86,6 +86,47 @@ impl VirtualChannelConfig {
     }
 }
 
+// ============================================================================
+// Strongly-typed mapping configs for JSON deserialization
+// ============================================================================
+
+/// Virtual channel parameters configuration (deserialized from parameters_json).
+///
+/// Virtual channels are simple data hubs and don't require complex configuration.
+///
+/// # Example JSON
+/// ```json
+/// {
+///     "name": "data_hub",
+///     "buffer_size": 2048
+/// }
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct VirtualChannelParamsConfig {
+    /// Channel name for identification.
+    #[serde(default = "default_virtual_name")]
+    pub name: String,
+
+    /// Event buffer size.
+    #[serde(default = "default_buffer_size")]
+    pub buffer_size: usize,
+}
+
+fn default_virtual_name() -> String {
+    "virtual".to_string()
+}
+
+fn default_buffer_size() -> usize {
+    1024
+}
+
+impl VirtualChannelParamsConfig {
+    /// Convert to VirtualChannelConfig.
+    pub fn to_config(&self) -> VirtualChannelConfig {
+        VirtualChannelConfig::new(&self.name).with_buffer_size(self.buffer_size)
+    }
+}
+
 /// Virtual channel diagnostics.
 #[derive(Debug, Default)]
 struct VirtualDiagnostics {
@@ -99,29 +140,29 @@ struct VirtualDiagnostics {
 /// This channel type:
 /// - Accepts data writes from any source via `write()` or `write_point()`
 /// - Stores data internally (no external DataStore dependency)
-/// - Emits events when data is written
+/// - Emits events when data is written (broadcast to all subscribers)
 /// - Returns accumulated data via `poll_once()`
 pub struct VirtualChannel {
     config: VirtualChannelConfig,
     /// Internal data buffer: point_id -> DataPoint
     data_buffer: DashMap<u32, DataPoint>,
     diagnostics: Arc<RwLock<VirtualDiagnostics>>,
+    /// Broadcast sender for event-driven subscribers.
     event_tx: DataEventSender,
-    _event_rx: Option<DataEventReceiver>,
     event_handler: Option<Arc<dyn DataEventHandler>>,
 }
 
 impl VirtualChannel {
     /// Create a new virtual channel.
     pub fn new(config: VirtualChannelConfig) -> Self {
-        let (event_tx, event_rx) = mpsc::channel(config.buffer_size);
+        // Use broadcast channel for multiple subscribers
+        let (event_tx, _) = broadcast::channel(config.buffer_size);
 
         Self {
             config,
             data_buffer: DashMap::new(),
             diagnostics: Arc::new(RwLock::new(VirtualDiagnostics::default())),
             event_tx,
-            _event_rx: Some(event_rx),
             event_handler: None,
         }
     }
@@ -141,11 +182,8 @@ impl VirtualChannel {
             self.data_buffer.insert(point.id, point.clone());
         }
 
-        // Emit event
-        let _ = self
-            .event_tx
-            .send(DataEvent::DataUpdate(batch.clone()))
-            .await;
+        // Emit event to all subscribers (broadcast is sync, not async)
+        let _ = self.event_tx.send(DataEvent::DataUpdate(batch.clone()));
 
         // Update diagnostics
         {
@@ -233,39 +271,6 @@ impl Protocol for VirtualChannel {
         ConnectionState::Connected
     }
 
-    async fn read(&self, request: ReadRequest) -> Result<ReadResponse> {
-        // Read from internal buffer
-        let batch = self.get_all_points();
-
-        // Filter by request if needed
-        let filtered = if let Some(ids) = &request.point_ids {
-            let mut result = DataBatch::new();
-            for point in batch.iter() {
-                if ids.contains(&point.id) {
-                    result.add(point.clone());
-                }
-            }
-            result
-        } else if let Some(data_type) = &request.data_type {
-            let mut result = DataBatch::new();
-            for point in batch.iter() {
-                if &point.data_type == data_type {
-                    result.add(point.clone());
-                }
-            }
-            result
-        } else {
-            batch
-        };
-
-        {
-            let mut diag = self.diagnostics.write().await;
-            diag.read_count += 1;
-        }
-
-        Ok(ReadResponse::success(filtered))
-    }
-
     async fn diagnostics(&self) -> Result<Diagnostics> {
         let diag = self.diagnostics.read().await;
 
@@ -300,20 +305,20 @@ impl ProtocolClient for VirtualChannel {
     /// For virtual channels, data is pushed (not polled), so this returns
     /// the accumulated data. The service layer should call this to get
     /// data that was pushed via `write()`.
-    async fn poll_once(&mut self) -> Result<DataBatch> {
+    async fn poll_once(&mut self) -> PollResult {
         let batch = self.get_all_points();
         {
             let mut diag = self.diagnostics.write().await;
             diag.read_count += 1;
         }
-        Ok(batch)
+        PollResult::success(batch)
     }
 
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
         // For virtual channels, control commands are stored as data points
         let mut batch = DataBatch::new();
         for cmd in commands {
-            batch.add(DataPoint::control(cmd.id, cmd.value));
+            batch.add(DataPoint::new(cmd.id, cmd.value));
         }
         self.write(&batch).await?;
         Ok(WriteResult::success(commands.len()))
@@ -323,34 +328,32 @@ impl ProtocolClient for VirtualChannel {
         // For virtual channels, adjustments are stored as data points
         let mut batch = DataBatch::new();
         for adj in adjustments {
-            batch.add(DataPoint::adjustment(adj.id, adj.value));
+            batch.add(DataPoint::new(adj.id, adj.value));
         }
         self.write(&batch).await?;
         Ok(WriteResult::success(adjustments.len()))
-    }
-
-    async fn start_polling(&mut self, _config: PollingConfig) -> Result<()> {
-        // No polling needed for virtual channels
-        Ok(())
-    }
-
-    async fn stop_polling(&mut self) -> Result<()> {
-        Ok(())
     }
 }
 
 impl EventDrivenProtocol for VirtualChannel {
     fn subscribe(&self) -> DataEventReceiver {
-        // Create a new channel for each subscriber
-        let (tx, rx) = mpsc::channel(self.config.buffer_size);
-        // Note: In a real implementation, you'd want to use broadcast
-        // or maintain a list of subscribers. This is simplified.
-        let _ = tx; // Placeholder - actual impl would store tx
-        rx
+        // Broadcast channel supports multiple subscribers
+        // Each call to subscribe() returns a new receiver that gets all future events
+        self.event_tx.subscribe()
     }
 
     fn set_event_handler(&mut self, handler: Arc<dyn DataEventHandler>) {
         self.event_handler = Some(handler);
+    }
+
+    async fn start(&mut self) -> Result<()> {
+        // Virtual channel is always "started" - no-op
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        // Virtual channel doesn't need explicit stop - no-op
+        Ok(())
     }
 }
 
@@ -359,21 +362,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_virtual_channel_write_read() {
+    async fn test_virtual_channel_write_poll() {
         let config = VirtualChannelConfig::new("test_channel");
-        let channel = VirtualChannel::new(config);
+        let mut channel = VirtualChannel::new(config);
 
         // Write a point
-        channel
-            .write_point(DataPoint::telemetry(1, 25.5))
-            .await
-            .unwrap();
+        channel.write_point(DataPoint::new(1, 25.5)).await.unwrap();
 
-        // Read it back
-        let response = channel.read(ReadRequest::all()).await.unwrap();
-        assert_eq!(response.data.len(), 1);
+        // Poll it back
+        let result = channel.poll_once().await;
+        assert!(result.is_success());
+        assert_eq!(result.data.len(), 1);
 
-        let point = response.data.iter().next().unwrap();
+        let point = result.data.iter().next().unwrap();
         assert_eq!(point.id, 1);
     }
 
@@ -391,18 +392,13 @@ mod tests {
         let mut channel = VirtualChannel::new(config);
 
         // Write some data
-        channel
-            .write_point(DataPoint::telemetry(1, 1.0))
-            .await
-            .unwrap();
-        channel
-            .write_point(DataPoint::telemetry(2, 2.0))
-            .await
-            .unwrap();
+        channel.write_point(DataPoint::new(1, 1.0)).await.unwrap();
+        channel.write_point(DataPoint::new(2, 2.0)).await.unwrap();
 
-        // Poll returns accumulated data
-        let batch = channel.poll_once().await.unwrap();
-        assert_eq!(batch.len(), 2);
+        // Poll returns accumulated data as PollResult
+        let result = channel.poll_once().await;
+        assert!(result.is_success());
+        assert_eq!(result.data.len(), 2);
     }
 
     #[tokio::test]
@@ -410,17 +406,36 @@ mod tests {
         let config = VirtualChannelConfig::new("diag_test");
         let channel = VirtualChannel::new(config);
 
-        channel
-            .write_point(DataPoint::telemetry(1, 1.0))
-            .await
-            .unwrap();
-        channel
-            .write_point(DataPoint::telemetry(2, 2.0))
-            .await
-            .unwrap();
+        channel.write_point(DataPoint::new(1, 1.0)).await.unwrap();
+        channel.write_point(DataPoint::new(2, 2.0)).await.unwrap();
 
         let diag = channel.diagnostics().await.unwrap();
         assert_eq!(diag.write_count, 2);
         assert_eq!(diag.protocol, "Virtual");
+    }
+
+    #[tokio::test]
+    async fn test_virtual_channel_broadcast_subscribe() {
+        let config = VirtualChannelConfig::new("broadcast_test");
+        let channel = VirtualChannel::new(config);
+
+        // Create two subscribers
+        let mut rx1 = channel.subscribe();
+        let mut rx2 = channel.subscribe();
+
+        // Write data
+        channel.write_point(DataPoint::new(1, 42.0)).await.unwrap();
+
+        // Both subscribers should receive the event
+        let event1 = rx1.recv().await.unwrap();
+        let event2 = rx2.recv().await.unwrap();
+
+        match (event1, event2) {
+            (DataEvent::DataUpdate(b1), DataEvent::DataUpdate(b2)) => {
+                assert_eq!(b1.len(), 1);
+                assert_eq!(b2.len(), 1);
+            }
+            _ => panic!("Expected DataUpdate events"),
+        }
     }
 }

@@ -1,13 +1,13 @@
 //! # Industrial Gateway (igw)
 //!
-//! A universal SCADA protocol library for Rust, providing unified abstractions
+//! A universal protocol library for Rust, providing unified abstractions
 //! for industrial communication protocols.
 //!
 //! ## Features
 //!
-//! - **Protocol Agnostic**: Unified four-remote (T/S/C/A) data model
+//! - **Protocol Agnostic**: Unified data model with point-based addressing
 //! - **Dual Mode Support**: Polling and event-driven communication
-//! - **Zero Business Coupling**: Pure protocol layer, no business logic
+//! - **Zero Business Coupling**: Pure protocol layer, no SCADA concepts
 //! - **Feature Gated**: Compile only what you need
 //!
 //! ## Quick Start
@@ -20,8 +20,8 @@
 //! let mut client = ModbusTcpClient::new("192.168.1.100:502")?;
 //! client.connect().await?;
 //!
-//! // Read telemetry data
-//! let response = client.read(ReadRequest::telemetry(vec![1, 2, 3])).await?;
+//! // Read data points
+//! let response = client.read(ReadRequest::all()).await?;
 //! ```
 //!
 //! ## Supported Protocols
@@ -38,7 +38,9 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod codec;
+pub mod config;
 pub mod core;
+pub mod gateway;
 pub mod protocols;
 
 /// Prelude module for convenient imports
@@ -54,7 +56,7 @@ pub mod prelude {
 }
 
 // Re-export core types at crate root for convenience
-pub use crate::core::data::{DataBatch, DataPoint, DataType, Value};
+pub use crate::core::data::{DataBatch, DataPoint, Value};
 pub use crate::core::error::{GatewayError, Result};
 pub use crate::core::logging::{
     ChannelLogConfig, ChannelLogEvent, ChannelLogHandler, LogContext, LogEventType, LogVerbosity,
@@ -67,4 +69,14 @@ pub use crate::core::metadata::{
 pub use crate::core::quality::Quality;
 pub use crate::core::traits::{
     CommunicationMode, ConnectionState, Protocol, ProtocolCapabilities, ProtocolClient,
+};
+
+// Re-export config types (generic utilities, no application-layer concepts)
+pub use crate::config::ChannelBuildResult;
+
+// Re-export gateway types (runtime trait + config)
+// 注：Gateway struct 已移至 examples/gateway_demo.rs
+pub use crate::gateway::{
+    parse_address, ChannelConfig, ChannelMode, ChannelModeConfig, ChannelRuntime, ConfigError,
+    GatewayConfig, GatewayGlobalConfig, PointDef,
 };

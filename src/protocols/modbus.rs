@@ -22,35 +22,228 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinHandle;
-use tokio::time::interval;
-use tracing::{debug, info, warn};
+use tracing::debug;
 use voltage_modbus::{ModbusClient, ModbusTcpClient};
 
 #[cfg(feature = "modbus")]
 use voltage_modbus::ModbusRtuClient;
 
-use crate::core::data::{DataBatch, DataPoint, DataType, Value};
+use crate::core::data::{DataBatch, DataPoint, Value};
 use crate::core::error::{GatewayError, Result};
 use crate::core::logging::{
     ChannelLogConfig, ChannelLogHandler, ErrorContext, LogContext, LoggableProtocol,
 };
 use crate::core::metadata::{DriverMetadata, HasMetadata, ParameterMetadata, ParameterType};
-use crate::core::point::{DataFormat, PointConfig, ProtocolAddress};
+use serde::Deserialize;
+
+use crate::core::point::{ByteOrder, DataFormat, ModbusAddress, PointConfig, ProtocolAddress};
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, Diagnostics,
-    PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
-    WriteResult,
+    PointFailure, PollResult, Protocol, ProtocolCapabilities, ProtocolClient, WriteResult,
 };
 use crate::protocols::command_batcher::{BatchCommand, CommandBatcher};
 
 // Type alias for grouped points: (slave_id, function_code) -> Vec<PointConfig>
 type GroupedPoints = HashMap<(u8, u8), Vec<PointConfig>>;
+
+// ============================================================================
+// Strongly-typed mapping configs for JSON deserialization
+// ============================================================================
+
+/// Modbus point mapping configuration (deserialized from protocol_mappings JSON).
+///
+/// # Required Fields
+/// - `register_address`: The Modbus register address (0-based). This field is **required**
+///   and deserialization will fail if missing.
+///
+/// # Optional Fields
+/// - `slave_id`: Unit/slave ID (default: 1)
+/// - `function_code`: Modbus function code (default: 3 = holding registers)
+/// - `data_type`: Data format (default: uint16)
+/// - `byte_order`: Byte order for multi-byte values (default: ABCD)
+/// - `bit_position`: Bit position for boolean extraction from register (0-15)
+///
+/// # Example JSON
+/// ```json
+/// {
+///     "slave_id": 1,
+///     "register_address": 100,
+///     "data_type": "float32",
+///     "byte_order": "ABCD"
+/// }
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModbusMappingConfig {
+    /// Slave/unit ID (default: 1).
+    #[serde(default = "default_slave_id")]
+    pub slave_id: u8,
+
+    /// Modbus function code (default: 3).
+    /// - 1: Read Coils
+    /// - 2: Read Discrete Inputs
+    /// - 3: Read Holding Registers
+    /// - 4: Read Input Registers
+    #[serde(default = "default_function_code")]
+    pub function_code: u8,
+
+    /// Register address (0-based). **Required field**.
+    pub register_address: u16,
+
+    /// Data format for register interpretation.
+    #[serde(default)]
+    pub data_type: DataFormat,
+
+    /// Byte order for multi-byte values.
+    #[serde(default)]
+    pub byte_order: ByteOrder,
+
+    /// Bit position for boolean values (0-15).
+    #[serde(default)]
+    pub bit_position: Option<u8>,
+}
+
+fn default_slave_id() -> u8 {
+    1
+}
+
+fn default_function_code() -> u8 {
+    3
+}
+
+impl ModbusMappingConfig {
+    /// Convert to igw ModbusAddress.
+    pub fn to_modbus_address(&self) -> ModbusAddress {
+        ModbusAddress {
+            slave_id: self.slave_id,
+            function_code: self.function_code,
+            register: self.register_address,
+            format: self.data_type,
+            byte_order: self.byte_order,
+            bit_position: self.bit_position,
+        }
+    }
+}
+
+/// Modbus channel parameters configuration (deserialized from parameters_json).
+///
+/// # TCP Mode
+/// ```json
+/// {
+///     "host": "192.168.1.100",
+///     "port": 502
+/// }
+/// ```
+///
+/// # RTU Mode
+/// ```json
+/// {
+///     "device": "/dev/ttyUSB0",
+///     "baud_rate": 9600
+/// }
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModbusChannelParamsConfig {
+    // TCP mode fields
+    /// Target host (TCP mode).
+    #[serde(default)]
+    pub host: Option<String>,
+
+    /// Target port (TCP mode, default: 502).
+    #[serde(default = "default_modbus_port")]
+    pub port: u16,
+
+    // RTU mode fields
+    /// Serial device path (RTU mode).
+    #[serde(default)]
+    pub device: Option<String>,
+
+    /// Baud rate (RTU mode, default: 9600).
+    #[serde(default = "default_baud_rate")]
+    pub baud_rate: u32,
+
+    // Common fields
+    /// Connect timeout in milliseconds (default: 5000).
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+
+    /// I/O timeout in milliseconds (default: 3000).
+    #[serde(default = "default_io_timeout_ms")]
+    pub io_timeout_ms: u64,
+
+    /// Maximum registers per batch read (default: 125).
+    #[serde(default = "default_max_batch_size_config")]
+    pub max_batch_size: u16,
+
+    /// Maximum gap between registers to allow merging (default: 10).
+    #[serde(default = "default_max_gap_config")]
+    pub max_gap: u16,
+}
+
+fn default_modbus_port() -> u16 {
+    502
+}
+
+fn default_baud_rate() -> u32 {
+    9600
+}
+
+fn default_connect_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_io_timeout_ms() -> u64 {
+    3000
+}
+
+fn default_max_batch_size_config() -> u16 {
+    125
+}
+
+fn default_max_gap_config() -> u16 {
+    10
+}
+
+impl ModbusChannelParamsConfig {
+    /// Check if this is a TCP configuration.
+    pub fn is_tcp(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// Check if this is an RTU configuration.
+    pub fn is_rtu(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Get TCP address string (host:port).
+    pub fn tcp_address(&self) -> Option<String> {
+        self.host.as_ref().map(|h| format!("{}:{}", h, self.port))
+    }
+
+    /// Convert to ModbusChannelConfig.
+    ///
+    /// Note: Points must be set separately via `with_points()`.
+    pub fn to_channel_config(&self) -> ModbusChannelConfig {
+        if self.is_tcp() {
+            ModbusChannelConfig::tcp(self.tcp_address().unwrap_or_default())
+                .with_connect_timeout(std::time::Duration::from_millis(self.connect_timeout_ms))
+                .with_io_timeout(std::time::Duration::from_millis(self.io_timeout_ms))
+                .with_max_batch_size(self.max_batch_size)
+                .with_max_gap(self.max_gap)
+        } else if let Some(device) = &self.device {
+            ModbusChannelConfig::rtu(device, self.baud_rate)
+                .with_io_timeout(std::time::Duration::from_millis(self.io_timeout_ms))
+                .with_max_batch_size(self.max_batch_size)
+                .with_max_gap(self.max_gap)
+        } else {
+            // Default to TCP with empty address (will fail on connect)
+            ModbusChannelConfig::tcp("")
+        }
+    }
+}
 
 /// Default maximum registers per batch read
 const DEFAULT_MAX_BATCH_SIZE: u16 = 125;
@@ -111,17 +304,6 @@ impl ReconnectConfig {
         self.zero_data_threshold = threshold;
         self
     }
-}
-
-/// Internal state for tracking reconnection attempts.
-#[derive(Debug, Default)]
-struct ReconnectState {
-    /// Current reconnect attempt count
-    attempts: u32,
-    /// Last reconnect attempt timestamp (milliseconds since epoch)
-    last_attempt_ms: u64,
-    /// Consecutive polling cycles with zero data
-    consecutive_zero_cycles: u32,
 }
 
 /// Connection mode for Modbus channel.
@@ -423,18 +605,10 @@ pub struct ModbusChannel {
     diagnostics: Arc<RwLock<ChannelDiagnostics>>,
 
     // === Polling support ===
-    /// Flag to control polling loop exit
-    is_polling: Arc<AtomicBool>,
-    /// Polling task handle (legacy support)
-    polling_handle: Option<JoinHandle<()>>,
     /// Pre-grouped points by (slave_id, function_code)
     grouped_points: Arc<RwLock<GroupedPoints>>,
     /// Polling interval in milliseconds
     polling_interval_ms: u64,
-
-    // === Reconnect support ===
-    /// Reconnect state for automatic recovery
-    reconnect_state: Arc<std::sync::RwLock<ReconnectState>>,
 
     // === Command batching ===
     /// Command batcher for optimizing write operations
@@ -481,11 +655,8 @@ impl ModbusChannel {
             client: Arc::new(Mutex::new(None)),
             state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
             diagnostics: Arc::new(RwLock::new(ChannelDiagnostics::default())),
-            is_polling: Arc::new(AtomicBool::new(false)),
-            polling_handle: None,
             grouped_points: Arc::new(RwLock::new(HashMap::new())),
             polling_interval_ms: DEFAULT_POLLING_INTERVAL_MS,
-            reconnect_state: Arc::new(std::sync::RwLock::new(ReconnectState::default())),
             command_batcher: Arc::new(Mutex::new(CommandBatcher::new())),
             log_context: Arc::new(LogContext::new(channel_id)),
         }
@@ -585,7 +756,7 @@ impl ModbusChannel {
         // Apply transform
         let transformed_value = apply_transform(value, &point.transform);
 
-        Ok(DataPoint::new(point.id, point.data_type, transformed_value))
+        Ok(DataPoint::new(point.id, transformed_value))
     }
 
     /// Record an error in diagnostics.
@@ -597,16 +768,12 @@ impl ModbusChannel {
 
     /// Pre-group points by (slave_id, function_code) for polling optimization.
     ///
-    /// Only Telemetry and Signal points are included (Control/Adjustment are not polled).
+    /// All configured points are included. The application layer determines
+    /// which points should be polled based on their SCADA type.
     async fn group_points_for_polling(&self) {
         let mut groups: GroupedPoints = HashMap::new();
 
         for point in &self.config.points {
-            // Only poll Telemetry and Signal points
-            if !matches!(point.data_type, DataType::Telemetry | DataType::Signal) {
-                continue;
-            }
-
             // Extract Modbus address
             if let ProtocolAddress::Modbus(addr) = &point.address {
                 let key = (addr.slave_id, addr.function_code);
@@ -691,10 +858,7 @@ impl ModbusChannel {
 
             if let Ok(value) = value_result {
                 let transformed = apply_transform(value, &point.transform);
-                results.push((
-                    point.id,
-                    DataPoint::new(point.id, point.data_type, transformed),
-                ));
+                results.push((point.id, DataPoint::new(point.id, transformed)));
             }
         }
 
@@ -844,10 +1008,7 @@ impl ModbusChannel {
                         modbus_addr.bit_position,
                     ) {
                         let transformed = apply_transform(value, &point.transform);
-                        results.push((
-                            point.id,
-                            DataPoint::new(point.id, point.data_type, transformed),
-                        ));
+                        results.push((point.id, DataPoint::new(point.id, transformed)));
                     }
                 }
             }
@@ -960,7 +1121,7 @@ impl ModbusChannel {
             .config
             .points
             .iter()
-            .find(|p| p.id == adj.id && p.data_type == DataType::Adjustment)
+            .find(|p| p.id == adj.id)
             .ok_or_else(|| GatewayError::InvalidAddress(format!("Point {} not found", adj.id)))?;
 
         let modbus_addr = match &point.address {
@@ -1215,14 +1376,6 @@ impl Protocol for ModbusChannel {
         self.get_state()
     }
 
-    async fn read(&self, _request: ReadRequest) -> Result<ReadResponse> {
-        // Note: This requires &mut self, but trait uses &self
-        // For now, return error - use ProtocolClient::read instead
-        Err(GatewayError::Internal(
-            "Use ProtocolClient methods for Modbus reads".into(),
-        ))
-    }
-
     async fn diagnostics(&self) -> Result<Diagnostics> {
         let state = self.get_state();
         let diag = self.diagnostics.read().await;
@@ -1324,11 +1477,6 @@ impl ProtocolClient for ModbusChannel {
     async fn disconnect(&mut self) -> Result<()> {
         let old_state = self.get_state();
 
-        // Stop polling first if running
-        if self.is_polling.load(Ordering::SeqCst) {
-            self.stop_polling().await?;
-        }
-
         let mut client_guard = self.client.lock().await;
         if let Some(mut client) = client_guard.take() {
             let _ = client.close().await;
@@ -1344,7 +1492,7 @@ impl ProtocolClient for ModbusChannel {
         Ok(())
     }
 
-    async fn poll_once(&mut self) -> Result<DataBatch> {
+    async fn poll_once(&mut self) -> PollResult {
         let start_time = std::time::Instant::now();
 
         // Ensure points are grouped for efficient polling
@@ -1360,7 +1508,14 @@ impl ProtocolClient for ModbusChannel {
                 self.log_context
                     .log_error("Not connected", ErrorContext::Polling)
                     .await;
-                return Err(GatewayError::NotConnected);
+                // Return failed result for all configured points
+                let failures: Vec<_> = self
+                    .config
+                    .points
+                    .iter()
+                    .map(|p| PointFailure::new(p.id, "Not connected"))
+                    .collect();
+                return PollResult::failed(failures);
             }
         };
 
@@ -1371,6 +1526,7 @@ impl ProtocolClient for ModbusChannel {
         }; // Lock released here
 
         let mut batch = DataBatch::default();
+        let mut failures = Vec::new();
         let mut read_count = 0u64;
         let mut error_count = 0u64;
 
@@ -1384,8 +1540,11 @@ impl ProtocolClient for ModbusChannel {
             .await;
 
             if results.is_empty() && !points.is_empty() {
-                // Read returned no results - possible communication error
+                // Read returned no results - record failures for all points in group
                 error_count += 1;
+                for point in points {
+                    failures.push(PointFailure::new(point.id, "Read failed - no response"));
+                }
             }
 
             for (_point_id, data_point) in results {
@@ -1404,9 +1563,10 @@ impl ProtocolClient for ModbusChannel {
         let duration_ms = start_time.elapsed().as_millis() as u64;
 
         debug!(
-            "[{}] poll_once: read {} points",
+            "[{}] poll_once: read {} points, {} failures",
             self.config.address,
-            batch.len()
+            batch.len(),
+            failures.len()
         );
 
         // Log poll cycle
@@ -1419,7 +1579,11 @@ impl ProtocolClient for ModbusChannel {
             )
             .await;
 
-        Ok(batch)
+        if failures.is_empty() {
+            PollResult::success(batch)
+        } else {
+            PollResult::partial(batch, failures)
+        }
     }
 
     async fn write_control(&mut self, commands: &[ControlCommand]) -> Result<WriteResult> {
@@ -1448,11 +1612,7 @@ impl ProtocolClient for ModbusChannel {
 
         for cmd in commands {
             // Find point config
-            let point = self
-                .config
-                .points
-                .iter()
-                .find(|p| p.id == cmd.id && p.data_type == DataType::Control);
+            let point = self.config.points.iter().find(|p| p.id == cmd.id);
 
             let point = match point {
                 Some(p) => p,
@@ -1570,11 +1730,7 @@ impl ProtocolClient for ModbusChannel {
 
         for adj in adjustments {
             // Find point config
-            let point = self
-                .config
-                .points
-                .iter()
-                .find(|p| p.id == adj.id && p.data_type == DataType::Adjustment);
+            let point = self.config.points.iter().find(|p| p.id == adj.id);
 
             let point = match point {
                 Some(p) => p,
@@ -1658,252 +1814,6 @@ impl ProtocolClient for ModbusChannel {
             .await;
 
         Ok(result)
-    }
-
-    /// Start background polling task (legacy method).
-    ///
-    /// **NOTE**: This is a legacy method kept for backward compatibility.
-    /// Prefer using `poll_once()` with an external loop managed by the service layer.
-    ///
-    /// In the new architecture, this method only polls and updates diagnostics.
-    /// The caller should use `poll_once()` instead and handle data storage themselves.
-    async fn start_polling(&mut self, config: PollingConfig) -> Result<()> {
-        // Check if already polling
-        if self.is_polling.load(Ordering::SeqCst) {
-            warn!("[{}] polling already running", self.config.address);
-            return Ok(());
-        }
-
-        // Set polling flag
-        self.is_polling.store(true, Ordering::SeqCst);
-
-        // Ensure points are grouped
-        self.group_points_for_polling().await;
-
-        // Use config interval if provided, otherwise use default
-        let interval_ms = if config.interval_ms > 0 {
-            config.interval_ms
-        } else {
-            self.polling_interval_ms
-        };
-
-        // Clone necessary state for the polling task
-        let client = Arc::clone(&self.client);
-        let grouped_points = Arc::clone(&self.grouped_points);
-        let is_polling = Arc::clone(&self.is_polling);
-        let diagnostics = Arc::clone(&self.diagnostics);
-        let state = Arc::clone(&self.state);
-        let reconnect_state = Arc::clone(&self.reconnect_state);
-
-        // Batch read configuration
-        let max_batch_size = self.config.max_batch_size;
-        let max_gap = self.config.max_gap;
-
-        // Reconnect configuration
-        let reconnect_config = self.config.reconnect.clone();
-        let target_address = self.config.address.clone();
-        let connect_timeout = self.config.connect_timeout;
-        let connection_mode = self.config.connection_mode;
-        #[cfg(feature = "modbus")]
-        let rtu_device = self.config.rtu_device.clone();
-        #[cfg(feature = "modbus")]
-        let baud_rate = self.config.baud_rate;
-
-        // Build display name for logging
-        let display_name = match connection_mode {
-            ConnectionMode::Tcp => target_address.clone(),
-            #[cfg(feature = "modbus")]
-            ConnectionMode::Rtu => format!("{}@{}", rtu_device, baud_rate),
-        };
-
-        info!(
-            "[{}] starting polling with {}ms interval (legacy mode - data not stored)",
-            display_name, interval_ms
-        );
-
-        // Spawn polling task
-        let handle = tokio::spawn(async move {
-            let mut poll_interval = interval(Duration::from_millis(interval_ms));
-            let mut consecutive_zero_cycles = 0u32;
-
-            while is_polling.load(Ordering::SeqCst) {
-                poll_interval.tick().await;
-
-                // Skip if not polling anymore
-                if !is_polling.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                // Check connection and attempt reconnect if needed
-                let mut client_guard = client.lock().await;
-
-                if client_guard.is_none() {
-                    // Connection lost - check if we should attempt reconnect
-                    let should_reconnect = {
-                        let mut rs = reconnect_state.write().unwrap();
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as u64;
-
-                        let cooldown_elapsed =
-                            now_ms - rs.last_attempt_ms >= reconnect_config.cooldown_ms;
-                        let attempts_ok = reconnect_config.max_attempts == 0
-                            || rs.attempts < reconnect_config.max_attempts;
-
-                        if cooldown_elapsed && attempts_ok {
-                            rs.attempts += 1;
-                            rs.last_attempt_ms = now_ms;
-                            true
-                        } else {
-                            false
-                        }
-                    };
-
-                    if should_reconnect {
-                        let attempt = reconnect_state.read().unwrap().attempts;
-                        info!(
-                            "[{}] attempting reconnect (attempt {})",
-                            display_name, attempt
-                        );
-
-                        // Attempt reconnect based on connection mode
-                        let reconnect_result: std::result::Result<ModbusClientWrapper, String> =
-                            match connection_mode {
-                                ConnectionMode::Tcp => {
-                                    match ModbusTcpClient::from_address(
-                                        &target_address,
-                                        connect_timeout,
-                                    )
-                                    .await
-                                    {
-                                        Ok(client) => Ok(ModbusClientWrapper::Tcp(client)),
-                                        Err(e) => Err(e.to_string()),
-                                    }
-                                }
-                                #[cfg(feature = "modbus")]
-                                ConnectionMode::Rtu => {
-                                    match ModbusRtuClient::new(&rtu_device, baud_rate) {
-                                        Ok(client) => Ok(ModbusClientWrapper::Rtu(client)),
-                                        Err(e) => Err(e.to_string()),
-                                    }
-                                }
-                            };
-
-                        match reconnect_result {
-                            Ok(new_client) => {
-                                info!("[{}] reconnected successfully", display_name);
-                                *client_guard = Some(new_client);
-                                if let Ok(mut s) = state.write() {
-                                    *s = ConnectionState::Connected;
-                                }
-                                if let Ok(mut rs) = reconnect_state.write() {
-                                    rs.attempts = 0;
-                                    rs.consecutive_zero_cycles = 0;
-                                }
-                                consecutive_zero_cycles = 0;
-                            }
-                            Err(e) => {
-                                warn!("[{}] reconnect failed: {}", display_name, e);
-                            }
-                        }
-                    }
-
-                    if client_guard.is_none() {
-                        continue;
-                    }
-                }
-
-                let client_ref = client_guard.as_mut().unwrap();
-
-                // Read all point groups - clone to release lock before async I/O
-                let groups: Vec<_> = {
-                    let g = grouped_points.read().await;
-                    g.iter().map(|(k, v)| (*k, v.clone())).collect()
-                }; // Lock released here
-
-                let mut batch = DataBatch::default();
-                let mut read_count = 0u64;
-                let mut error_count = 0u64;
-
-                for ((_slave_id, _fc), points) in groups.iter() {
-                    let results =
-                        Self::read_point_group(client_ref, points, max_batch_size, max_gap).await;
-
-                    if results.is_empty() && !points.is_empty() {
-                        error_count += 1;
-                    }
-
-                    for (_point_id, data_point) in results {
-                        batch.add(data_point);
-                        read_count += 1;
-                    }
-                }
-
-                drop(client_guard);
-
-                // Track zero-data cycles for reconnect trigger
-                if batch.is_empty() && !groups.is_empty() {
-                    consecutive_zero_cycles += 1;
-
-                    if consecutive_zero_cycles >= reconnect_config.zero_data_threshold {
-                        warn!(
-                            "[{}] {} consecutive zero-data cycles, triggering reconnect",
-                            display_name, consecutive_zero_cycles
-                        );
-
-                        if let Ok(mut s) = state.write() {
-                            *s = ConnectionState::Disconnected;
-                        }
-                        let mut client_guard = client.lock().await;
-                        if let Some(c) = client_guard.take() {
-                            drop(c);
-                        }
-                        consecutive_zero_cycles = 0;
-                    }
-                } else if !batch.is_empty() {
-                    consecutive_zero_cycles = 0;
-                    debug!(
-                        "[{}] polled {} points (legacy mode)",
-                        display_name,
-                        batch.len()
-                    );
-                }
-
-                // Update diagnostics
-                {
-                    let mut diag = diagnostics.write().await;
-                    diag.read_count += read_count;
-                    diag.error_count += error_count;
-                }
-            }
-
-            info!("[{}] polling task stopped", display_name);
-        });
-
-        self.polling_handle = Some(handle);
-        Ok(())
-    }
-
-    async fn stop_polling(&mut self) -> Result<()> {
-        if !self.is_polling.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-
-        info!("[{}] stopping polling", self.config.address);
-
-        // Signal polling task to stop
-        self.is_polling.store(false, Ordering::SeqCst);
-
-        // Wait for task to complete (with timeout)
-        if let Some(handle) = self.polling_handle.take() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if !handle.is_finished() {
-                handle.abort();
-            }
-        }
-
-        Ok(())
     }
 }
 

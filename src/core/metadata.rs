@@ -204,6 +204,51 @@ fn build_registry() -> ProtocolRegistry {
         });
     }
 
+    // Register IEC 104 protocol
+    #[cfg(feature = "iec104")]
+    {
+        use crate::protocols::iec104::Iec104Channel;
+        let iec104_meta = Iec104Channel::metadata();
+        registry.register(ProtocolMetadata {
+            name: "iec104",
+            display_name: "IEC 60870-5-104",
+            description: "IEC 104 telecontrol protocol over TCP/IP",
+            protocol_type: "iec104",
+            drivers: vec![iec104_meta],
+            supports_points: true,
+        });
+    }
+
+    // Register OPC UA protocol
+    #[cfg(feature = "opcua")]
+    {
+        use crate::protocols::opcua::OpcUaChannel;
+        let opcua_meta = OpcUaChannel::metadata();
+        registry.register(ProtocolMetadata {
+            name: "opcua",
+            display_name: "OPC UA",
+            description: "OPC UA client for industrial automation",
+            protocol_type: "opcua",
+            drivers: vec![opcua_meta],
+            supports_points: true,
+        });
+    }
+
+    // Register CAN protocol (Linux only)
+    #[cfg(all(feature = "can", target_os = "linux"))]
+    {
+        use crate::protocols::can::CanClient;
+        let can_meta = CanClient::metadata();
+        registry.register(ProtocolMetadata {
+            name: "can",
+            display_name: "CAN Bus",
+            description: "Controller Area Network (CAN) bus protocol",
+            protocol_type: "can",
+            drivers: vec![can_meta],
+            supports_points: true,
+        });
+    }
+
     // Register Virtual protocol
     {
         use crate::protocols::virtual_channel::VirtualChannel;

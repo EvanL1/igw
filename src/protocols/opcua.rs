@@ -40,20 +40,18 @@ use opcua::client::{ClientBuilder, DataChangeCallback, IdentityToken, MonitoredI
 use opcua::crypto::SecurityPolicy;
 use opcua::types::{
     AttributeId, DataValue, Identifier, MessageSecurityMode, MonitoredItemCreateRequest, NodeId,
-    QualifiedName, ReadValueId, StatusCode, TimestampsToReturn, UAString, UserTokenPolicy, Variant,
-    WriteValue,
+    StatusCode, TimestampsToReturn, UAString, UserTokenPolicy, Variant, WriteValue,
 };
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, RwLock};
 
-use crate::core::data::{DataBatch, DataPoint, DataType, Value};
+use crate::core::data::{DataBatch, DataPoint, Value};
 use crate::core::error::{GatewayError, Result};
 use crate::core::point::{PointConfig, ProtocolAddress};
 use crate::core::quality::Quality;
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
     DataEventHandler, DataEventReceiver, DataEventSender, Diagnostics, EventDrivenProtocol,
-    PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
-    WriteResult,
+    PollResult, Protocol, ProtocolCapabilities, ProtocolClient, WriteResult,
 };
 
 /// OPC UA security policy.
@@ -392,6 +390,111 @@ impl OpcUaChannelConfig {
     }
 }
 
+/// OPC UA channel parameters for JSON configuration.
+///
+/// This is a serde-friendly version of the configuration that can be
+/// deserialized from JSON and converted to `OpcUaChannelConfig`.
+///
+/// # Example JSON
+///
+/// ```json
+/// {
+///     "endpoint_url": "opc.tcp://192.168.1.100:4840",
+///     "username": "user",
+///     "password": "pass",
+///     "trust_server_certs": true
+/// }
+/// ```
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OpcUaParamsConfig {
+    /// OPC UA server endpoint URL
+    pub endpoint_url: String,
+
+    /// Application name (optional)
+    #[serde(default = "default_app_name")]
+    pub application_name: String,
+
+    /// Username for authentication (optional, for username/password mode)
+    #[serde(default)]
+    pub username: Option<String>,
+
+    /// Password for authentication (optional)
+    #[serde(default)]
+    pub password: Option<String>,
+
+    /// Connection timeout in milliseconds
+    #[serde(default = "default_opcua_connect_timeout")]
+    pub connect_timeout_ms: u64,
+
+    /// Session timeout in milliseconds
+    #[serde(default = "default_session_timeout")]
+    pub session_timeout_ms: u64,
+
+    /// Whether to trust server certificates
+    #[serde(default = "default_trust_certs")]
+    pub trust_server_certs: bool,
+
+    /// Publishing interval in milliseconds for subscription
+    #[serde(default = "default_publishing_interval")]
+    pub publishing_interval_ms: u64,
+
+    /// Sampling interval in milliseconds for monitored items
+    #[serde(default = "default_sampling_interval")]
+    pub sampling_interval_ms: u64,
+}
+
+fn default_app_name() -> String {
+    "igw OPC UA Client".to_string()
+}
+
+fn default_opcua_connect_timeout() -> u64 {
+    10000
+}
+
+fn default_session_timeout() -> u64 {
+    60000
+}
+
+fn default_trust_certs() -> bool {
+    true
+}
+
+fn default_publishing_interval() -> u64 {
+    1000
+}
+
+fn default_sampling_interval() -> u64 {
+    500
+}
+
+impl OpcUaParamsConfig {
+    /// Convert to OpcUaChannelConfig.
+    ///
+    /// Note: Points must be set separately via `with_points()`.
+    pub fn to_config(&self) -> OpcUaChannelConfig {
+        let mut config = OpcUaChannelConfig::new(&self.endpoint_url)
+            .with_application_name(&self.application_name)
+            .with_connect_timeout(Duration::from_millis(self.connect_timeout_ms))
+            .with_session_timeout(Duration::from_millis(self.session_timeout_ms))
+            .with_trust_server_certs(self.trust_server_certs)
+            .with_subscription(SubscriptionConfig {
+                publishing_interval_ms: self.publishing_interval_ms,
+                ..SubscriptionConfig::default()
+            })
+            .with_monitored_item(MonitoredItemConfig {
+                sampling_interval_ms: self.sampling_interval_ms as i64,
+                ..MonitoredItemConfig::default()
+            });
+
+        // Set identity based on username/password
+        if let (Some(username), Some(password)) = (&self.username, &self.password) {
+            config = config.with_user_identity(username, password);
+        }
+
+        config
+    }
+}
+
 /// Create a key for NodeID mapping.
 fn make_node_id_key(namespace_index: u16, identifier: &str) -> String {
     format!("ns={};{}", namespace_index, identifier)
@@ -432,11 +535,8 @@ pub struct OpcUaChannel {
     state: Arc<std::sync::RwLock<ConnectionState>>,
     /// Diagnostics.
     diagnostics: Arc<RwLock<ChannelDiagnostics>>,
-    /// Event sender.
+    /// Broadcast sender for event-driven subscribers (multiple subscribers supported).
     event_tx: DataEventSender,
-    /// Event receiver (for subscribe()).
-    #[allow(dead_code)]
-    event_rx: Option<DataEventReceiver>,
     /// Event handler.
     event_handler: Option<Arc<dyn DataEventHandler>>,
     /// Current subscription ID.
@@ -446,7 +546,8 @@ pub struct OpcUaChannel {
 impl OpcUaChannel {
     /// Create a new OPC UA channel.
     pub fn new(config: OpcUaChannelConfig) -> Self {
-        let (event_tx, event_rx) = mpsc::channel(1024);
+        // Use broadcast channel for multiple subscribers
+        let (event_tx, _) = broadcast::channel(1024);
 
         Self {
             config,
@@ -454,7 +555,6 @@ impl OpcUaChannel {
             state: Arc::new(std::sync::RwLock::new(ConnectionState::Disconnected)),
             diagnostics: Arc::new(RwLock::new(ChannelDiagnostics::default())),
             event_tx,
-            event_rx: Some(event_rx),
             event_handler: None,
             subscription_id: None,
         }
@@ -592,26 +692,6 @@ impl OpcUaChannel {
         Ok(count)
     }
 
-    /// Read node values directly.
-    async fn read_nodes(&self, node_ids: &[NodeId]) -> Result<Vec<DataValue>> {
-        let session = self.session.as_ref().ok_or(GatewayError::NotConnected)?;
-
-        let read_value_ids: Vec<ReadValueId> = node_ids
-            .iter()
-            .map(|node_id| ReadValueId {
-                node_id: node_id.clone(),
-                attribute_id: AttributeId::Value as u32,
-                index_range: UAString::null(),
-                data_encoding: QualifiedName::null(),
-            })
-            .collect();
-
-        session
-            .read(&read_value_ids, TimestampsToReturn::Both, 0.0)
-            .await
-            .map_err(|e| GatewayError::Protocol(format!("Read failed: {}", e)))
-    }
-
     /// Write node values.
     async fn write_nodes(&self, write_values: Vec<WriteValue>) -> Result<Vec<StatusCode>> {
         let session = self.session.as_ref().ok_or(GatewayError::NotConnected)?;
@@ -640,67 +720,6 @@ impl ProtocolCapabilities for OpcUaChannel {
 impl Protocol for OpcUaChannel {
     fn connection_state(&self) -> ConnectionState {
         self.get_state()
-    }
-
-    async fn read(&self, request: ReadRequest) -> Result<ReadResponse> {
-        // OPC UA supports direct reading
-        let _session = self.session.as_ref().ok_or(GatewayError::NotConnected)?;
-
-        // Determine points to read
-        let points_to_read: Vec<_> = if let Some(ids) = &request.point_ids {
-            self.config
-                .points
-                .iter()
-                .filter(|p| ids.contains(&p.id))
-                .collect()
-        } else if let Some(data_type) = &request.data_type {
-            self.config
-                .points
-                .iter()
-                .filter(|p| &p.data_type == data_type)
-                .collect()
-        } else {
-            self.config.points.iter().collect()
-        };
-
-        if points_to_read.is_empty() {
-            return Ok(ReadResponse::success(DataBatch::new()));
-        }
-
-        // Build NodeId list
-        let node_ids: Vec<NodeId> = points_to_read
-            .iter()
-            .filter_map(|point| {
-                if let ProtocolAddress::OpcUa(addr) = &point.address {
-                    Some(parse_node_id(&addr.node_id, addr.namespace_index))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Execute read
-        let data_values = self.read_nodes(&node_ids).await?;
-
-        // Convert results
-        let mut batch = DataBatch::new();
-        let mut failed_count = 0;
-
-        for (i, dv) in data_values.iter().enumerate() {
-            if i >= points_to_read.len() {
-                break;
-            }
-
-            let point_config = points_to_read[i];
-
-            if let Some(data_point) = convert_data_value_to_point(point_config, dv) {
-                batch.add(data_point);
-            } else {
-                failed_count += 1;
-            }
-        }
-
-        Ok(ReadResponse::partial(batch, failed_count))
     }
 
     async fn diagnostics(&self) -> Result<Diagnostics> {
@@ -795,8 +814,7 @@ impl ProtocolClient for OpcUaChannel {
         // Send connection event
         let _ = self
             .event_tx
-            .send(DataEvent::ConnectionChanged(ConnectionState::Connected))
-            .await;
+            .send(DataEvent::ConnectionChanged(ConnectionState::Connected));
 
         Ok(())
     }
@@ -818,8 +836,7 @@ impl ProtocolClient for OpcUaChannel {
         // Send disconnect event
         let _ = self
             .event_tx
-            .send(DataEvent::ConnectionChanged(ConnectionState::Disconnected))
-            .await;
+            .send(DataEvent::ConnectionChanged(ConnectionState::Disconnected));
 
         Ok(())
     }
@@ -954,7 +971,7 @@ impl ProtocolClient for OpcUaChannel {
         })
     }
 
-    async fn poll_once(&mut self) -> Result<DataBatch> {
+    async fn poll_once(&mut self) -> PollResult {
         // OPC UA is event-driven via subscriptions.
         // Data changes are received asynchronously through the subscription callback.
         // For poll_once, we check for any pending session events but typically
@@ -964,21 +981,34 @@ impl ProtocolClient for OpcUaChannel {
         // but the OPC UA SDK handles this internally via async tasks.
 
         if !self.get_state().is_connected() {
-            return Err(GatewayError::NotConnected);
+            // Return empty result with no failure tracking (connection-level issue)
+            return PollResult::success(DataBatch::new());
         }
 
         // Return empty batch - data comes through subscription callbacks
-        Ok(DataBatch::new())
+        PollResult::success(DataBatch::new())
+    }
+}
+
+impl EventDrivenProtocol for OpcUaChannel {
+    fn subscribe(&self) -> DataEventReceiver {
+        // Broadcast channel supports multiple subscribers
+        // Each call to subscribe() returns a new receiver that gets all future events
+        self.event_tx.subscribe()
     }
 
-    async fn start_polling(&mut self, _config: PollingConfig) -> Result<()> {
-        // For OPC UA, "polling" means creating a subscription with monitored items
+    fn set_event_handler(&mut self, handler: Arc<dyn DataEventHandler>) {
+        self.event_handler = Some(handler);
+    }
+
+    async fn start(&mut self) -> Result<()> {
+        // For OPC UA, start means creating a subscription with monitored items
         self.create_subscription().await?;
         self.add_monitored_items().await?;
         Ok(())
     }
 
-    async fn stop_polling(&mut self) -> Result<()> {
+    async fn stop(&mut self) -> Result<()> {
         // Delete subscription
         if let (Some(session), Some(sub_id)) = (&self.session, self.subscription_id.take()) {
             session
@@ -995,19 +1025,6 @@ impl ProtocolClient for OpcUaChannel {
         }
 
         Ok(())
-    }
-}
-
-impl EventDrivenProtocol for OpcUaChannel {
-    fn subscribe(&self) -> DataEventReceiver {
-        // Note: This is a stub implementation that creates a new channel.
-        // In a real implementation, we'd need to properly manage subscriptions.
-        let (_tx, rx) = mpsc::channel(1024);
-        rx
-    }
-
-    fn set_event_handler(&mut self, handler: Arc<dyn DataEventHandler>) {
-        self.event_handler = Some(handler);
     }
 }
 
@@ -1075,7 +1092,7 @@ async fn handle_data_change(
     }
 
     // Send event (service layer handles storage)
-    let _ = event_tx.send(DataEvent::DataUpdate(batch.clone())).await;
+    let _ = event_tx.send(DataEvent::DataUpdate(batch.clone()));
 
     // Call event handler
     if let Some(handler) = event_handler {
@@ -1086,11 +1103,6 @@ async fn handle_data_change(
     let mut diag = diagnostics.write().await;
     diag.recv_count += 1;
     diag.last_data_received = Some(std::time::Instant::now());
-}
-
-/// Convert DataValue to DataPoint.
-fn convert_data_value_to_point(config: &PointConfig, dv: &DataValue) -> Option<DataPoint> {
-    convert_data_value_with_id(config.id, Some(config), dv)
 }
 
 /// Convert DataValue to DataPoint with explicit ID.
@@ -1116,15 +1128,6 @@ fn convert_data_value_with_id(
         .as_ref()
         .and_then(opcua_datetime_to_chrono);
 
-    // Determine data type
-    let data_type = config.map(|c| c.data_type).unwrap_or_else(|| {
-        if matches!(igw_value, Value::Bool(_)) {
-            DataType::Signal
-        } else {
-            DataType::Telemetry
-        }
-    });
-
     // Apply transform if config is available
     let final_value = if let Some(cfg) = config {
         if let Some(f) = igw_value.as_f64() {
@@ -1140,7 +1143,6 @@ fn convert_data_value_with_id(
 
     Some(DataPoint {
         id: point_id,
-        data_type,
         value: final_value,
         quality,
         timestamp,
@@ -1181,6 +1183,96 @@ fn convert_status_code_to_quality(status: StatusCode) -> Quality {
 /// Convert OPC UA DateTime to chrono DateTime.
 fn opcua_datetime_to_chrono(dt: &opcua::types::DateTime) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_millis(dt.as_chrono().timestamp_millis())
+}
+
+// ============================================================================
+// HasMetadata Implementation
+// ============================================================================
+
+use crate::core::metadata::{DriverMetadata, HasMetadata, ParameterMetadata, ParameterType};
+
+impl HasMetadata for OpcUaChannel {
+    fn metadata() -> DriverMetadata {
+        DriverMetadata {
+            name: "opcua",
+            display_name: "OPC UA",
+            description: "OPC UA client for industrial automation data exchange.",
+            is_recommended: true,
+            example_config: serde_json::json!({
+                "endpoint_url": "opc.tcp://192.168.1.100:4840",
+                "application_name": "IGW OPC UA Client",
+                "username": "user",
+                "password": "password",
+                "trust_server_certs": true,
+                "publishing_interval_ms": 1000,
+                "sampling_interval_ms": 500
+            }),
+            parameters: vec![
+                ParameterMetadata::required(
+                    "endpoint_url",
+                    "Endpoint URL",
+                    "OPC UA server endpoint URL (opc.tcp://host:port)",
+                    ParameterType::String,
+                ),
+                ParameterMetadata::optional(
+                    "application_name",
+                    "Application Name",
+                    "Client application name for identification",
+                    ParameterType::String,
+                    serde_json::json!("IGW OPC UA Client"),
+                ),
+                ParameterMetadata::optional(
+                    "username",
+                    "Username",
+                    "Username for authentication (if using username/password)",
+                    ParameterType::String,
+                    serde_json::Value::Null,
+                ),
+                ParameterMetadata::optional(
+                    "password",
+                    "Password",
+                    "Password for authentication",
+                    ParameterType::String,
+                    serde_json::Value::Null,
+                ),
+                ParameterMetadata::optional(
+                    "connect_timeout_ms",
+                    "Connect Timeout (ms)",
+                    "Connection timeout in milliseconds",
+                    ParameterType::Integer,
+                    serde_json::json!(30000),
+                ),
+                ParameterMetadata::optional(
+                    "session_timeout_ms",
+                    "Session Timeout (ms)",
+                    "Session timeout in milliseconds",
+                    ParameterType::Integer,
+                    serde_json::json!(60000),
+                ),
+                ParameterMetadata::optional(
+                    "trust_server_certs",
+                    "Trust Server Certs",
+                    "Auto-trust server certificates (for development)",
+                    ParameterType::Boolean,
+                    serde_json::json!(true),
+                ),
+                ParameterMetadata::optional(
+                    "publishing_interval_ms",
+                    "Publishing Interval (ms)",
+                    "Subscription publishing interval in milliseconds",
+                    ParameterType::Integer,
+                    serde_json::json!(1000),
+                ),
+                ParameterMetadata::optional(
+                    "sampling_interval_ms",
+                    "Sampling Interval (ms)",
+                    "Monitored item sampling interval in milliseconds",
+                    ParameterType::Integer,
+                    serde_json::json!(500),
+                ),
+            ],
+        }
+    }
 }
 
 #[cfg(test)]

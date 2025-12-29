@@ -1,82 +1,14 @@
 //! Data types for the Industrial Gateway.
 //!
-//! This module defines the core data model based on the "Four Remotes" (四遥) concept:
-//! - **Telemetry (T)**: Analog input values (遥测)
-//! - **Signal (S)**: Digital input status (遥信)
-//! - **Control (C)**: Digital output commands (遥控)
-//! - **Adjustment (A)**: Analog output setpoints (遥调)
+//! This module defines the core data model for protocol-agnostic data representation.
+//! igw is a pure protocol library - it does NOT know about SCADA concepts like
+//! "Four Remotes" (四遥: Telemetry/Signal/Control/Adjustment). The application
+//! layer (e.g., comsrv) is responsible for categorizing data points.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::core::quality::Quality;
-
-/// The four types of remote data in SCADA systems.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DataType {
-    /// Telemetry - Analog input measurement (遥测)
-    ///
-    /// Examples: temperature, pressure, power, current
-    Telemetry,
-
-    /// Signal - Digital input status (遥信)
-    ///
-    /// Examples: switch position, alarm status, door open/closed
-    Signal,
-
-    /// Control - Digital output command (遥控)
-    ///
-    /// Examples: start/stop motor, open/close valve
-    Control,
-
-    /// Adjustment - Analog output setpoint (遥调)
-    ///
-    /// Examples: power setpoint, temperature target, speed reference
-    Adjustment,
-}
-
-impl DataType {
-    /// Get the short code for this data type.
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Telemetry => "T",
-            Self::Signal => "S",
-            Self::Control => "C",
-            Self::Adjustment => "A",
-        }
-    }
-
-    /// Check if this is an input type (device → system).
-    #[inline]
-    pub fn is_input(&self) -> bool {
-        matches!(self, Self::Telemetry | Self::Signal)
-    }
-
-    /// Check if this is an output type (system → device).
-    #[inline]
-    pub fn is_output(&self) -> bool {
-        matches!(self, Self::Control | Self::Adjustment)
-    }
-
-    /// Check if this is an analog type.
-    #[inline]
-    pub fn is_analog(&self) -> bool {
-        matches!(self, Self::Telemetry | Self::Adjustment)
-    }
-
-    /// Check if this is a digital type.
-    #[inline]
-    pub fn is_digital(&self) -> bool {
-        matches!(self, Self::Signal | Self::Control)
-    }
-}
-
-impl std::fmt::Display for DataType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
 
 /// A protocol-agnostic value representation.
 ///
@@ -84,13 +16,13 @@ impl std::fmt::Display for DataType {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
-    /// Floating-point number (most common for telemetry/adjustment)
+    /// Floating-point number (most common for analog values)
     Float(f64),
 
     /// Integer value
     Integer(i64),
 
-    /// Boolean value (common for signals/controls)
+    /// Boolean value (common for digital I/O)
     Bool(bool),
 
     /// String value
@@ -212,18 +144,19 @@ impl From<&str> for Value {
 }
 
 /// A single data point with timestamp and quality.
+///
+/// This is a protocol-layer data structure. It does NOT contain SCADA-level
+/// categorization (Telemetry/Signal/Control/Adjustment). The application layer
+/// determines the point type based on `id` lookup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataPoint {
     /// Point identifier (numeric, application-level ID)
     pub id: u32,
 
-    /// Data type (T/S/C/A)
-    pub data_type: DataType,
-
     /// The value
     pub value: Value,
 
-    /// Data quality indicator
+    /// Data quality indicator (protocol-layer concept)
     #[serde(default)]
     pub quality: Quality,
 
@@ -237,35 +170,14 @@ pub struct DataPoint {
 
 impl DataPoint {
     /// Create a new data point with current timestamp.
-    pub fn new(id: u32, data_type: DataType, value: impl Into<Value>) -> Self {
+    pub fn new(id: u32, value: impl Into<Value>) -> Self {
         Self {
             id,
-            data_type,
             value: value.into(),
             quality: Quality::Good,
             timestamp: Utc::now(),
             source_timestamp: None,
         }
-    }
-
-    /// Create a telemetry data point.
-    pub fn telemetry(id: u32, value: impl Into<Value>) -> Self {
-        Self::new(id, DataType::Telemetry, value)
-    }
-
-    /// Create a signal data point.
-    pub fn signal(id: u32, value: bool) -> Self {
-        Self::new(id, DataType::Signal, value)
-    }
-
-    /// Create a control data point.
-    pub fn control(id: u32, value: bool) -> Self {
-        Self::new(id, DataType::Control, value)
-    }
-
-    /// Create an adjustment data point.
-    pub fn adjustment(id: u32, value: impl Into<Value>) -> Self {
-        Self::new(id, DataType::Adjustment, value)
     }
 
     /// Set the quality.
@@ -283,20 +195,15 @@ impl DataPoint {
     }
 }
 
-/// A batch of data points, organized by type.
+/// A batch of data points.
+///
+/// Simple collection without SCADA-level categorization.
+/// The application layer is responsible for routing/storing
+/// points based on their type (determined by id lookup).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DataBatch {
-    /// Telemetry points
-    pub telemetry: Vec<DataPoint>,
-
-    /// Signal points
-    pub signal: Vec<DataPoint>,
-
-    /// Control points
-    pub control: Vec<DataPoint>,
-
-    /// Adjustment points
-    pub adjustment: Vec<DataPoint>,
+    /// All data points in this batch
+    points: Vec<DataPoint>,
 }
 
 impl DataBatch {
@@ -305,58 +212,76 @@ impl DataBatch {
         Self::default()
     }
 
-    /// Add a data point to the appropriate list.
+    /// Create a batch from a vector of points.
+    pub fn from_points(points: Vec<DataPoint>) -> Self {
+        Self { points }
+    }
+
+    /// Add a data point.
     pub fn add(&mut self, point: DataPoint) {
-        match point.data_type {
-            DataType::Telemetry => self.telemetry.push(point),
-            DataType::Signal => self.signal.push(point),
-            DataType::Control => self.control.push(point),
-            DataType::Adjustment => self.adjustment.push(point),
-        }
+        self.points.push(point);
     }
 
     /// Get total number of points.
     pub fn len(&self) -> usize {
-        self.telemetry.len() + self.signal.len() + self.control.len() + self.adjustment.len()
+        self.points.len()
     }
 
     /// Check if batch is empty.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.points.is_empty()
     }
 
     /// Merge another batch into this one.
     pub fn merge(&mut self, other: DataBatch) {
-        self.telemetry.extend(other.telemetry);
-        self.signal.extend(other.signal);
-        self.control.extend(other.control);
-        self.adjustment.extend(other.adjustment);
+        self.points.extend(other.points);
     }
 
     /// Iterate over all points.
     pub fn iter(&self) -> impl Iterator<Item = &DataPoint> {
-        self.telemetry
-            .iter()
-            .chain(self.signal.iter())
-            .chain(self.control.iter())
-            .chain(self.adjustment.iter())
+        self.points.iter()
+    }
+
+    /// Get mutable iterator over all points.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut DataPoint> {
+        self.points.iter_mut()
+    }
+
+    /// Consume the batch and return the underlying vector.
+    pub fn into_vec(self) -> Vec<DataPoint> {
+        self.points
+    }
+}
+
+impl IntoIterator for DataBatch {
+    type Item = DataPoint;
+    type IntoIter = std::vec::IntoIter<DataPoint>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.points.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a DataBatch {
+    type Item = &'a DataPoint;
+    type IntoIter = std::slice::Iter<'a, DataPoint>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.points.iter()
+    }
+}
+
+impl FromIterator<DataPoint> for DataBatch {
+    fn from_iter<I: IntoIterator<Item = DataPoint>>(iter: I) -> Self {
+        Self {
+            points: iter.into_iter().collect(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_data_type() {
-        assert!(DataType::Telemetry.is_input());
-        assert!(DataType::Signal.is_input());
-        assert!(DataType::Control.is_output());
-        assert!(DataType::Adjustment.is_output());
-
-        assert!(DataType::Telemetry.is_analog());
-        assert!(DataType::Signal.is_digital());
-    }
 
     #[test]
     fn test_value_conversions() {
@@ -370,13 +295,31 @@ mod tests {
     }
 
     #[test]
+    fn test_data_point() {
+        let point = DataPoint::new(1, 25.5);
+        assert_eq!(point.id, 1);
+        assert_eq!(point.value.as_f64(), Some(25.5));
+        assert_eq!(point.quality, Quality::Good);
+    }
+
+    #[test]
     fn test_data_batch() {
         let mut batch = DataBatch::new();
-        batch.add(DataPoint::telemetry(1, 25.5));
-        batch.add(DataPoint::signal(2, true));
+        batch.add(DataPoint::new(1, 25.5));
+        batch.add(DataPoint::new(2, true));
 
         assert_eq!(batch.len(), 2);
-        assert_eq!(batch.telemetry.len(), 1);
-        assert_eq!(batch.signal.len(), 1);
+        assert!(!batch.is_empty());
+
+        // Test iteration
+        let ids: Vec<u32> = batch.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_data_batch_from_iter() {
+        let points = vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)];
+        let batch: DataBatch = points.into_iter().collect();
+        assert_eq!(batch.len(), 2);
     }
 }

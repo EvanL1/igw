@@ -1,14 +1,29 @@
 //! Core traits for protocol implementations.
 //!
 //! This module defines the fundamental traits that all protocols must implement.
+//!
+//! # Trait Hierarchy
+//!
+//! ```text
+//! Layer 1: Basic Capabilities (stateless queries)
+//! ├── ProtocolCapabilities  // metadata: name, modes, version
+//! └── Protocol              // connection_state, diagnostics
+//!
+//! Layer 2: Core Operations (single responsibility)
+//! ├── ProtocolClient        // connect, disconnect, poll_once, write_*
+//! └── EventDrivenProtocol   // event_stream (broadcast)
+//!
+//! Layer 3: Optional Extensions
+//! └── ProtocolServer        // listen, stop, connected_clients
+//! ```
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
-use crate::core::data::{DataBatch, DataType};
+use crate::core::data::DataBatch;
 use crate::core::error::Result;
 
 /// Communication mode supported by a protocol.
@@ -80,48 +95,26 @@ impl std::fmt::Display for ConnectionState {
 }
 
 /// Request for reading data points.
-#[derive(Debug, Clone)]
+///
+/// Simple request type for protocol-layer reads. The application layer
+/// is responsible for any SCADA-level filtering (by type, etc.).
+#[derive(Debug, Clone, Default)]
 pub struct ReadRequest {
-    /// Data type to read (None = all types)
-    pub data_type: Option<DataType>,
-
-    /// Point IDs to read (None = all points)
+    /// Point IDs to read (None = all configured points)
     pub point_ids: Option<Vec<u32>>,
 }
 
 impl ReadRequest {
-    /// Create a request for all points of a specific type.
-    pub fn by_type(data_type: DataType) -> Self {
-        Self {
-            data_type: Some(data_type),
-            point_ids: None,
-        }
-    }
-
     /// Create a request for specific points.
     pub fn by_ids(ids: Vec<u32>) -> Self {
         Self {
-            data_type: None,
             point_ids: Some(ids),
         }
     }
 
-    /// Create a request for all telemetry points.
-    pub fn telemetry() -> Self {
-        Self::by_type(DataType::Telemetry)
-    }
-
-    /// Create a request for all signal points.
-    pub fn signal() -> Self {
-        Self::by_type(DataType::Signal)
-    }
-
-    /// Create a request for all points.
+    /// Create a request for all configured points.
     pub fn all() -> Self {
-        Self {
-            data_type: None,
-            point_ids: None,
-        }
+        Self { point_ids: None }
     }
 }
 
@@ -276,14 +269,94 @@ impl WriteResult {
     }
 }
 
+// ============================================================================
+// Poll Result Types
+// ============================================================================
+
+/// Result of a poll operation (supports partial success).
+///
+/// Unlike `Result<DataBatch>`, this type can represent scenarios where
+/// some points were read successfully while others failed.
+#[derive(Debug, Clone, Default)]
+pub struct PollResult {
+    /// Successfully collected data points.
+    pub data: DataBatch,
+
+    /// Points that failed to read.
+    pub failures: Vec<PointFailure>,
+}
+
+impl PollResult {
+    /// Create a successful result with no failures.
+    pub fn success(data: DataBatch) -> Self {
+        Self {
+            data,
+            failures: vec![],
+        }
+    }
+
+    /// Create a result with partial failures.
+    pub fn partial(data: DataBatch, failures: Vec<PointFailure>) -> Self {
+        Self { data, failures }
+    }
+
+    /// Create a failed result with no data.
+    pub fn failed(failures: Vec<PointFailure>) -> Self {
+        Self {
+            data: DataBatch::default(),
+            failures,
+        }
+    }
+
+    /// Check if any points failed to read.
+    pub fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
+    /// Check if poll was completely successful.
+    pub fn is_success(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// Get number of successfully read points.
+    pub fn success_count(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Get number of failed points.
+    pub fn failure_count(&self) -> usize {
+        self.failures.len()
+    }
+}
+
+/// Information about a point that failed to read.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PointFailure {
+    /// The point ID that failed.
+    pub point_id: u32,
+
+    /// Error message describing the failure.
+    pub error: String,
+}
+
+impl PointFailure {
+    /// Create a new point failure.
+    pub fn new(point_id: u32, error: impl Into<String>) -> Self {
+        Self {
+            point_id,
+            error: error.into(),
+        }
+    }
+}
+
 /// Polling configuration.
 #[derive(Debug, Clone)]
 pub struct PollingConfig {
     /// Polling interval in milliseconds.
     pub interval_ms: u64,
 
-    /// Data types to poll (None = all).
-    pub data_types: Option<Vec<DataType>>,
+    /// Point IDs to poll (None = all configured points).
+    pub point_ids: Option<Vec<u32>>,
 
     /// Whether to continue on individual point errors.
     pub continue_on_error: bool,
@@ -293,7 +366,7 @@ impl Default for PollingConfig {
     fn default() -> Self {
         Self {
             interval_ms: 1000,
-            data_types: None,
+            point_ids: None,
             continue_on_error: true,
         }
     }
@@ -364,19 +437,25 @@ pub trait ProtocolCapabilities {
     }
 }
 
-/// Base protocol trait - read-only operations.
+/// Base protocol trait - connection status and diagnostics.
+///
+/// This trait provides read-only access to protocol state. For data acquisition,
+/// use `ProtocolClient::poll_once()` instead.
 pub trait Protocol: ProtocolCapabilities + Send + Sync {
     /// Get current connection state.
     fn connection_state(&self) -> ConnectionState;
 
-    /// Read data points.
-    fn read(&self, request: ReadRequest) -> impl Future<Output = Result<ReadResponse>> + Send;
-
     /// Get diagnostics information.
+    ///
+    /// Returns protocol statistics including read/write counts, error counts,
+    /// and protocol-specific extra information.
     fn diagnostics(&self) -> impl Future<Output = Result<Diagnostics>> + Send;
 }
 
-/// Client protocol trait - active connection + write operations.
+/// Client protocol trait - active connection + data operations.
+///
+/// This trait combines connection lifecycle management with data acquisition
+/// and command writing capabilities.
 pub trait ProtocolClient: Protocol {
     /// Connect to the target device/server.
     fn connect(&mut self) -> impl Future<Output = Result<()>> + Send;
@@ -387,34 +466,34 @@ pub trait ProtocolClient: Protocol {
     /// Execute a single poll cycle and return collected data.
     ///
     /// This is the primary method for data acquisition. The caller (service layer)
-    /// is responsible for storing the returned data. The protocol layer only
-    /// handles device communication.
+    /// is responsible for:
+    /// - Managing the polling loop (interval, scheduling)
+    /// - Storing the returned data
+    /// - Handling reconnection on failures
     ///
     /// # Returns
     ///
-    /// A `DataBatch` containing all successfully read points from configured sources.
-    fn poll_once(&mut self) -> impl Future<Output = Result<DataBatch>> + Send;
+    /// A `PollResult` containing:
+    /// - `data`: Successfully read data points
+    /// - `failures`: Points that failed to read (partial success supported)
+    fn poll_once(&mut self) -> impl Future<Output = PollResult> + Send;
 
-    /// Write control commands.
+    /// Write control commands (遥控).
+    ///
+    /// Control commands are boolean operations (ON/OFF, OPEN/CLOSE) with
+    /// optional pulse duration for momentary outputs.
     fn write_control(
         &mut self,
         commands: &[ControlCommand],
     ) -> impl Future<Output = Result<WriteResult>> + Send;
 
-    /// Write adjustment commands.
+    /// Write adjustment commands (遥调).
+    ///
+    /// Adjustment commands are setpoint operations with floating-point values.
     fn write_adjustment(
         &mut self,
         adjustments: &[AdjustmentCommand],
     ) -> impl Future<Output = Result<WriteResult>> + Send;
-
-    /// Start polling task (legacy, prefer using poll_once() with external loop).
-    ///
-    /// This method is kept for backward compatibility. New implementations
-    /// should use `poll_once()` with an external polling loop managed by the service layer.
-    fn start_polling(&mut self, config: PollingConfig) -> impl Future<Output = Result<()>> + Send;
-
-    /// Stop polling task.
-    fn stop_polling(&mut self) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// Server protocol trait - passive connection acceptance.
@@ -445,11 +524,11 @@ pub enum DataEvent {
     Heartbeat,
 }
 
-/// Event receiver type.
-pub type DataEventReceiver = mpsc::Receiver<DataEvent>;
+/// Event receiver type (broadcast supports multiple subscribers).
+pub type DataEventReceiver = broadcast::Receiver<DataEvent>;
 
-/// Event sender type.
-pub type DataEventSender = mpsc::Sender<DataEvent>;
+/// Event sender type (broadcast supports multiple subscribers).
+pub type DataEventSender = broadcast::Sender<DataEvent>;
 
 /// Event handler trait.
 ///
@@ -467,12 +546,46 @@ pub trait DataEventHandler: Send + Sync {
 }
 
 /// Event-driven protocol extension trait.
+///
+/// Protocols implementing this trait can push data events to subscribers
+/// instead of (or in addition to) being polled.
 pub trait EventDrivenProtocol: Protocol {
     /// Subscribe to data events.
+    ///
+    /// Returns a broadcast receiver that will receive all events from this protocol.
+    /// Multiple subscribers can call this method and each will receive all events.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut rx = protocol.subscribe();
+    /// tokio::spawn(async move {
+    ///     while let Ok(event) = rx.recv().await {
+    ///         match event {
+    ///             DataEvent::DataUpdate(batch) => { /* handle data */ }
+    ///             DataEvent::ConnectionChanged(state) => { /* handle state change */ }
+    ///             _ => {}
+    ///         }
+    ///     }
+    /// });
+    /// ```
     fn subscribe(&self) -> DataEventReceiver;
 
-    /// Set event handler.
+    /// Set event handler for callback-style event processing.
+    ///
+    /// This is an alternative to `subscribe()` for protocols that prefer
+    /// callback-based event handling.
     fn set_event_handler(&mut self, handler: Arc<dyn DataEventHandler>);
+
+    /// Start receiving events from the device/server.
+    ///
+    /// For IEC 104, this triggers STARTDT. For OPC UA, this activates subscriptions.
+    fn start(&mut self) -> impl Future<Output = Result<()>> + Send;
+
+    /// Stop receiving events.
+    ///
+    /// For IEC 104, this triggers STOPDT. For OPC UA, this deactivates subscriptions.
+    fn stop(&mut self) -> impl Future<Output = Result<()>> + Send;
 }
 
 #[cfg(test)]
@@ -488,13 +601,6 @@ mod tests {
     }
 
     #[test]
-    fn test_read_request() {
-        let req = ReadRequest::telemetry();
-        assert_eq!(req.data_type, Some(DataType::Telemetry));
-        assert!(req.point_ids.is_none());
-    }
-
-    #[test]
     fn test_control_command() {
         let cmd = ControlCommand::latching(1, true);
         assert!(cmd.pulse_duration_ms.is_none());
@@ -504,52 +610,51 @@ mod tests {
     }
 
     #[test]
-    fn test_read_response_success() {
+    fn test_poll_result_success() {
         let batch = DataBatch::new();
-        let resp = ReadResponse::success(batch);
-        assert!(!resp.has_errors());
-        assert!(resp.error_summary().is_none());
+        let result = PollResult::success(batch);
+        assert!(result.is_success());
+        assert!(!result.has_failures());
+        assert_eq!(result.failure_count(), 0);
     }
 
     #[test]
-    fn test_read_response_with_errors() {
+    fn test_poll_result_partial() {
         let batch = DataBatch::new();
-        let errors = vec![(1, "error 1".to_string()), (2, "error 2".to_string())];
-        let resp = ReadResponse::with_errors(batch, errors);
+        let failures = vec![
+            PointFailure::new(1, "error 1"),
+            PointFailure::new(2, "error 2"),
+        ];
+        let result = PollResult::partial(batch, failures);
 
-        assert!(resp.has_errors());
-        assert_eq!(resp.failed_count, 2);
-        assert_eq!(resp.partial_errors.len(), 2);
-
-        let summary = resp.error_summary().unwrap();
-        assert_eq!(summary.0, 2); // count
-        assert_eq!(summary.1.len(), 2); // first 2 errors
+        assert!(!result.is_success());
+        assert!(result.has_failures());
+        assert_eq!(result.failure_count(), 2);
     }
 
     #[test]
-    fn test_read_response_error_summary_limits() {
-        let batch = DataBatch::new();
-        let errors: Vec<_> = (0..10).map(|i| (i, format!("error {}", i))).collect();
-        let resp = ReadResponse::with_errors(batch, errors);
+    fn test_poll_result_failed() {
+        let failures = vec![PointFailure::new(1, "connection timeout")];
+        let result = PollResult::failed(failures);
 
-        let summary = resp.error_summary().unwrap();
-        assert_eq!(summary.0, 10); // total count
-        assert_eq!(summary.1.len(), 3); // only first 3
+        assert!(!result.is_success());
+        assert!(result.has_failures());
+        assert_eq!(result.success_count(), 0);
+        assert_eq!(result.failure_count(), 1);
     }
 
     #[test]
-    fn test_read_response_partial_backward_compat() {
-        // partial() sets failed_count but no error details
-        let batch = DataBatch::new();
-        let resp = ReadResponse::partial(batch, 5);
+    fn test_point_failure() {
+        let failure = PointFailure::new(42, "read timeout");
+        assert_eq!(failure.point_id, 42);
+        assert_eq!(failure.error, "read timeout");
+    }
 
-        assert!(resp.has_errors());
-        assert_eq!(resp.failed_count, 5);
-        assert!(resp.partial_errors.is_empty());
-
-        // error_summary should still work
-        let summary = resp.error_summary().unwrap();
-        assert_eq!(summary.0, 5); // count from failed_count
-        assert!(summary.1.is_empty()); // no details
+    #[test]
+    fn test_write_result() {
+        let result = WriteResult::success(5);
+        assert!(result.is_success());
+        assert_eq!(result.success_count, 5);
+        assert!(result.failures.is_empty());
     }
 }

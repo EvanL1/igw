@@ -5,10 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::data::DataType;
 use crate::core::error::GatewayError;
 
 /// Protocol-agnostic point configuration.
+///
+/// This is a pure protocol-layer type. It does NOT contain SCADA-level
+/// categorization (Telemetry/Signal/Control/Adjustment). The application
+/// layer determines point type based on its own configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PointConfig {
     /// Unique point identifier (numeric).
@@ -17,9 +20,6 @@ pub struct PointConfig {
     /// Human-readable name (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-
-    /// Data type (T/S/C/A).
-    pub data_type: DataType,
 
     /// Protocol-specific address.
     pub address: ProtocolAddress,
@@ -43,11 +43,10 @@ fn default_true() -> bool {
 
 impl PointConfig {
     /// Create a new point configuration.
-    pub fn new(id: u32, data_type: DataType, address: ProtocolAddress) -> Self {
+    pub fn new(id: u32, address: ProtocolAddress) -> Self {
         Self {
             id,
             name: None,
-            data_type,
             address,
             transform: TransformConfig::default(),
             poll_group: None,
@@ -347,27 +346,40 @@ pub enum Dnp3PointType {
 }
 
 /// Data format for protocol values.
+///
+/// Supports multiple serde aliases for flexibility in JSON configs:
+/// - `uint16` / `u16`, `int16` / `i16`, etc.
+/// - `float32` / `f32` / `float`, `float64` / `f64` / `double`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataFormat {
     /// Boolean.
+    #[serde(alias = "boolean")]
     Bool,
     /// Unsigned 16-bit integer.
     #[default]
+    #[serde(alias = "u16")]
     UInt16,
     /// Signed 16-bit integer.
+    #[serde(alias = "i16")]
     Int16,
     /// Unsigned 32-bit integer.
+    #[serde(alias = "u32")]
     UInt32,
     /// Signed 32-bit integer.
+    #[serde(alias = "i32")]
     Int32,
     /// Unsigned 64-bit integer.
+    #[serde(alias = "u64")]
     UInt64,
     /// Signed 64-bit integer.
+    #[serde(alias = "i64")]
     Int64,
     /// 32-bit floating point.
+    #[serde(alias = "f32", alias = "float")]
     Float32,
     /// 64-bit floating point.
+    #[serde(alias = "f64", alias = "double")]
     Float64,
     /// String (fixed length).
     String,
@@ -397,22 +409,29 @@ impl DataFormat {
 }
 
 /// Byte order for multi-byte values.
+///
+/// Supports multiple serde aliases for flexibility in JSON configs:
+/// - `ABCD` / `BIG_ENDIAN` / `BE` / `big_endian`
+/// - `DCBA` / `LITTLE_ENDIAN` / `LE` / `little_endian`
+/// - `BADC` / `WORD_SWAP`, `CDAB` / `BYTE_SWAP`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ByteOrder {
     /// Big-endian (ABCD) - network byte order.
     #[default]
-    #[serde(alias = "big_endian")]
+    #[serde(alias = "big_endian", alias = "BIG_ENDIAN", alias = "BE")]
     Abcd,
 
     /// Little-endian (DCBA).
-    #[serde(alias = "little_endian")]
+    #[serde(alias = "little_endian", alias = "LITTLE_ENDIAN", alias = "LE")]
     Dcba,
 
     /// Mid-big-endian (BADC) - word swap.
+    #[serde(alias = "WORD_SWAP", alias = "word_swap")]
     Badc,
 
     /// Mid-little-endian (CDAB) - byte swap.
+    #[serde(alias = "BYTE_SWAP", alias = "byte_swap")]
     Cdab,
 }
 

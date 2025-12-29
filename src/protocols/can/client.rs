@@ -7,18 +7,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use socketcan::{CanSocket, EmbeddedFrame, Frame, Socket};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use crate::core::data::{DataBatch, DataPoint};
+use tracing::{info, warn};
+
+use crate::core::data::{DataBatch, DataPoint, DataType};
 use crate::core::error::{GatewayError, Result};
+use crate::core::point::{PointConfig, ProtocolAddress, TransformConfig};
 
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
     DataEventHandler, DataEventReceiver, DataEventSender, Diagnostics, EventDrivenProtocol,
-    PollingConfig, Protocol, ProtocolCapabilities, ProtocolClient, ReadRequest, ReadResponse,
-    WriteResult,
+    PollResult, Protocol, ProtocolCapabilities, ProtocolClient, WriteResult,
 };
 
 use super::config::{CanConfig, CanFrameCache, LynkCanId};
@@ -48,8 +50,8 @@ pub struct CanClient {
     receive_handle: Option<JoinHandle<()>>,
     read_handle: Option<JoinHandle<()>>,
 
-    // Event channel
-    event_sender: Option<DataEventSender>,
+    // Event channel (broadcast for multiple subscribers)
+    event_tx: DataEventSender,
     event_handler: Option<Arc<dyn DataEventHandler>>,
 
     // CAN frame cache
@@ -66,6 +68,8 @@ impl CanClient {
     /// Create a new CAN client with the given configuration.
     pub fn new(config: CanConfig) -> Self {
         let point_manager = PointManager::new();
+        // Use broadcast channel for multiple subscribers
+        let (event_tx, _) = broadcast::channel(1024);
 
         Self {
             config,
@@ -76,7 +80,7 @@ impl CanClient {
             last_error: Arc::new(RwLock::new(None)),
             receive_handle: None,
             read_handle: None,
-            event_sender: None,
+            event_tx,
             event_handler: None,
             frame_cache: Arc::new(RwLock::new(CanFrameCache::new())),
             point_manager: Arc::new(point_manager),
@@ -263,7 +267,7 @@ impl CanClient {
         let read_count = Arc::clone(&self.read_count);
         let error_count = Arc::clone(&self.error_count);
         let last_error = Arc::clone(&self.last_error);
-        let event_sender = self.event_sender.clone();
+        let event_tx = self.event_tx.clone();
         let event_handler = self.event_handler.clone();
         let read_interval = self.config.data_read_interval_ms;
 
@@ -340,15 +344,10 @@ impl CanClient {
                                 batch.len()
                             );
 
-                            // Send event
-                            if let Some(ref sender) = event_sender {
-                                #[cfg(feature = "tracing-support")]
-                                tracing::debug!("Sending DataUpdate event via event_sender");
-                                let _ = sender.send(DataEvent::DataUpdate(batch.clone())).await;
-                            } else {
-                                #[cfg(feature = "tracing-support")]
-                                tracing::warn!("No event_sender available");
-                            }
+                            // Send event (broadcast is sync, not async)
+                            #[cfg(feature = "tracing-support")]
+                            tracing::debug!("Sending DataUpdate event via event_tx");
+                            let _ = event_tx.send(DataEvent::DataUpdate(batch.clone()));
 
                             // Call handler
                             if let Some(ref handler) = event_handler {
@@ -409,46 +408,6 @@ impl ProtocolCapabilities for CanClient {
 impl Protocol for CanClient {
     fn connection_state(&self) -> ConnectionState {
         *futures::executor::block_on(self.connection_state.read())
-    }
-
-    async fn read(&self, request: ReadRequest) -> Result<ReadResponse> {
-        let cached = self.cached_data.read().await;
-
-        let mut batch = DataBatch::new();
-
-        match (&request.data_type, &request.point_ids) {
-            (None, None) => {
-                // Return all cached data
-                for point in cached.values() {
-                    batch.add(point.clone());
-                }
-            }
-            (Some(dtype), None) => {
-                for point in cached.values() {
-                    if point.data_type == *dtype {
-                        batch.add(point.clone());
-                    }
-                }
-            }
-            (None, Some(ids)) => {
-                for id in ids {
-                    if let Some(point) = cached.get(id) {
-                        batch.add(point.clone());
-                    }
-                }
-            }
-            (Some(dtype), Some(ids)) => {
-                for id in ids {
-                    if let Some(point) = cached.get(id) {
-                        if point.data_type == *dtype {
-                            batch.add(point.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(ReadResponse::success(batch))
     }
 
     async fn diagnostics(&self) -> Result<Diagnostics> {
@@ -516,14 +475,14 @@ impl ProtocolClient for CanClient {
         Ok(())
     }
 
-    async fn poll_once(&mut self) -> Result<DataBatch> {
+    async fn poll_once(&mut self) -> PollResult {
         // CAN protocol is event-driven, return current cached data
         let cached = self.cached_data.read().await;
         let mut batch = DataBatch::new();
         for point in cached.values() {
             batch.add(point.clone());
         }
-        Ok(batch)
+        PollResult::success(batch)
     }
 
     async fn write_control(&mut self, _commands: &[ControlCommand]) -> Result<WriteResult> {
@@ -540,29 +499,84 @@ impl ProtocolClient for CanClient {
             "Write adjustment not supported for CAN protocol".to_string(),
         ))
     }
-
-    async fn start_polling(&mut self, _config: PollingConfig) -> Result<()> {
-        // CAN is event-driven, polling is not applicable
-        Err(GatewayError::Unsupported(
-            "Polling mode not supported for CAN protocol (use event-driven mode)".to_string(),
-        ))
-    }
-
-    async fn stop_polling(&mut self) -> Result<()> {
-        // CAN is event-driven, polling is not applicable
-        Ok(())
-    }
 }
 
 impl EventDrivenProtocol for CanClient {
     fn subscribe(&self) -> DataEventReceiver {
-        let (_tx, rx) = mpsc::channel(100);
-        // Note: This is a workaround for &self constraint - in production, use interior mutability
-        // For now, just return a receiver
-        rx
+        // Broadcast channel supports multiple subscribers
+        self.event_tx.subscribe()
     }
 
     fn set_event_handler(&mut self, handler: Arc<dyn DataEventHandler>) {
         self.event_handler = Some(handler);
+    }
+
+    async fn start(&mut self) -> Result<()> {
+        // CAN client starts automatically on connect
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        // Stop receive and read tasks
+        if let Some(handle) = self.receive_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.read_handle.take() {
+            handle.abort();
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// HasMetadata Implementation
+// ============================================================================
+
+use crate::core::metadata::{DriverMetadata, HasMetadata, ParameterMetadata, ParameterType};
+
+impl HasMetadata for CanClient {
+    fn metadata() -> DriverMetadata {
+        DriverMetadata {
+            name: "can",
+            display_name: "CAN Bus",
+            description: "Controller Area Network (CAN) bus protocol for industrial and automotive applications.",
+            is_recommended: true,
+            example_config: serde_json::json!({
+                "interface": "can0",
+                "bitrate": 250000,
+                "rx_poll_interval_ms": 50,
+                "data_read_interval_ms": 1000
+            }),
+            parameters: vec![
+                ParameterMetadata::optional(
+                    "interface",
+                    "CAN Interface",
+                    "SocketCAN interface name (e.g., can0, vcan0)",
+                    ParameterType::String,
+                    serde_json::json!("can0"),
+                ),
+                ParameterMetadata::optional(
+                    "bitrate",
+                    "Bitrate",
+                    "CAN bus bitrate in bits per second",
+                    ParameterType::Integer,
+                    serde_json::json!(250000),
+                ),
+                ParameterMetadata::optional(
+                    "rx_poll_interval_ms",
+                    "RX Poll Interval (ms)",
+                    "Interval for polling received CAN frames",
+                    ParameterType::Integer,
+                    serde_json::json!(50),
+                ),
+                ParameterMetadata::optional(
+                    "data_read_interval_ms",
+                    "Data Read Interval (ms)",
+                    "Interval for reading and processing data",
+                    ParameterType::Integer,
+                    serde_json::json!(1000),
+                ),
+            ],
+        }
     }
 }
