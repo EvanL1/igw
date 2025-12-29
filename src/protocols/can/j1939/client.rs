@@ -11,9 +11,8 @@ use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 use voltage_j1939::{database_stats, decode_frame, extract_source_address};
 
-use crate::core::data::{DataBatch, DataPoint, DataType, Value};
+use crate::core::data::{DataBatch, DataPoint, Value};
 use crate::core::error::{GatewayError, Result};
-use crate::core::quality::Quality;
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
     DataEventHandler, DataEventReceiver, DataEventSender, Diagnostics, EventDrivenProtocol,
@@ -146,22 +145,16 @@ impl J1939Client {
                                 continue;
                             }
 
-                            let timestamp = chrono::Utc::now();
                             let mut batch = DataBatch::new();
 
                             for decoded in decoded_spns {
-                                let data_point = DataPoint {
-                                    id: decoded.spn.to_string(),
-                                    data_type: DataType::Telemetry,
-                                    value: Value::Float(decoded.value),
-                                    quality: Quality::Good,
-                                    timestamp,
-                                    source_timestamp: None,
-                                };
+                                // J1939 uses SPN as point ID (converted to u32)
+                                let data_point =
+                                    DataPoint::new(decoded.spn, Value::Float(decoded.value));
 
                                 batch.add(data_point.clone());
 
-                                // Update cache
+                                // Update cache using SPN string as key
                                 cached_data
                                     .write()
                                     .await

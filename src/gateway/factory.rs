@@ -144,7 +144,7 @@ fn create_opcua_channel(config: &ChannelConfig) -> Result<Box<dyn ChannelRuntime
 #[cfg(all(feature = "can", target_os = "linux"))]
 fn create_can_channel(config: &ChannelConfig) -> Result<Box<dyn ChannelRuntime>> {
     use super::wrappers::CanRuntime;
-    use crate::protocols::can::{CanChannelParamsConfig, CanConfig};
+    use crate::protocols::can::CanChannelParamsConfig;
 
     // Parse parameters
     let params: CanChannelParamsConfig = serde_json::from_value(config.parameters.clone())

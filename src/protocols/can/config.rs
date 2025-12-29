@@ -177,7 +177,7 @@ fn default_data_read_interval() -> u64 {
 
 impl CanChannelParamsConfig {
     /// Convert to CanConfig.
-    pub fn to_can_config(&self) -> CanConfig {
+    pub fn to_config(&self) -> CanConfig {
         CanConfig {
             can_interface: self.interface.clone(),
             bitrate: self.bitrate,

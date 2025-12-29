@@ -63,8 +63,6 @@ use tokio::sync::RwLock;
 use tokio_gpiod::{Chip, Options};
 
 use serde::Deserialize;
-#[cfg(feature = "tracing-support")]
-use tracing::{info, warn};
 
 use crate::core::data::{DataBatch, DataPoint};
 use crate::core::error::{GatewayError, Result};

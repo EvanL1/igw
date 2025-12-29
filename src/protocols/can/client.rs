@@ -11,11 +11,8 @@ use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
-use tracing::{info, warn};
-
-use crate::core::data::{DataBatch, DataPoint, DataType};
+use crate::core::data::{DataBatch, DataPoint};
 use crate::core::error::{GatewayError, Result};
-use crate::core::point::{PointConfig, ProtocolAddress, TransformConfig};
 
 use crate::core::traits::{
     AdjustmentCommand, CommunicationMode, ConnectionState, ControlCommand, DataEvent,
@@ -307,27 +304,18 @@ impl CanClient {
                             continue;
                         }
 
-                        let timestamp = chrono::Utc::now();
                         let mut batch = DataBatch::new();
 
-                        for (point_id, (value, data_type, quality)) in decoded_points {
+                        for (point_id, (value, quality)) in decoded_points {
                             #[cfg(feature = "tracing-support")]
                             tracing::debug!(
-                                "  Point {}: {:?} (type: {:?}, quality: {:?})",
+                                "  Point {}: {:?} (quality: {:?})",
                                 point_id,
                                 value,
-                                data_type,
                                 quality
                             );
 
-                            let data_point = DataPoint {
-                                id: point_id,
-                                data_type,
-                                value,
-                                quality,
-                                timestamp,
-                                source_timestamp: None,
-                            };
+                            let data_point = DataPoint::new(point_id, value);
 
                             batch.add(data_point.clone());
 

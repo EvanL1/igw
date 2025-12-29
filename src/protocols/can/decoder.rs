@@ -3,7 +3,7 @@
 //! Provides functions to extract and decode fields from CAN frame data,
 //! supporting various data types with Little-Endian byte ordering
 
-use crate::core::data::{DataType, Value};
+use crate::core::data::Value;
 use crate::core::error::{GatewayError, Result};
 use crate::core::quality::Quality;
 use crate::protocols::can::config::CanPoint;
@@ -44,14 +44,14 @@ impl PointManager {
     pub fn apply_mappings(
         &self,
         frame_cache: &super::config::CanFrameCache,
-    ) -> Result<HashMap<u32, (Value, DataType, Quality)>> {
+    ) -> Result<HashMap<u32, (Value, Quality)>> {
         let mut result = HashMap::new();
 
         for (point_id, point) in &self.points {
             if let Some(frame_data) = frame_cache.get(point.can_id) {
                 match decode_point(point, frame_data) {
-                    Ok((value, data_type)) => {
-                        result.insert(*point_id, (value, data_type, Quality::Good));
+                    Ok(value) => {
+                        result.insert(*point_id, (value, Quality::Good));
                     }
                     Err(e) => {
                         #[cfg(feature = "tracing-support")]
@@ -163,7 +163,7 @@ fn extract_field(
 }
 
 /// Decode a CAN point
-fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<(Value, DataType)> {
+fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<Value> {
     // Extract raw bytes
     let raw_bytes = extract_field(
         frame_data,
@@ -173,12 +173,12 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<(Value, DataType)
     )?;
 
     // Decode based on data type
-    let (raw_value, data_type) = match point.data_type.as_str() {
+    let raw_value = match point.data_type.as_str() {
         "uint8" => {
             if raw_bytes.is_empty() {
                 return Err(GatewayError::Protocol("Empty data for uint8".to_string()));
             }
-            (Value::Integer(raw_bytes[0] as i64), DataType::Telemetry)
+            Value::Integer(raw_bytes[0] as i64)
         }
         "uint16" => {
             if raw_bytes.len() < 2 {
@@ -188,7 +188,7 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<(Value, DataType)
                 )));
             }
             let raw = u16::from_le_bytes([raw_bytes[0], raw_bytes[1]]);
-            (Value::Integer(raw as i64), DataType::Telemetry)
+            Value::Integer(raw as i64)
         }
         "int16" => {
             if raw_bytes.len() < 2 {
@@ -198,7 +198,7 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<(Value, DataType)
                 )));
             }
             let raw = i16::from_le_bytes([raw_bytes[0], raw_bytes[1]]);
-            (Value::Integer(raw as i64), DataType::Telemetry)
+            Value::Integer(raw as i64)
         }
         "uint32" => {
             if raw_bytes.len() < 4 {
@@ -208,7 +208,7 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<(Value, DataType)
                 )));
             }
             let raw = u32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]);
-            (Value::Integer(raw as i64), DataType::Telemetry)
+            Value::Integer(raw as i64)
         }
         "int32" => {
             if raw_bytes.len() < 4 {
@@ -218,7 +218,7 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<(Value, DataType)
                 )));
             }
             let raw = i32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]);
-            (Value::Integer(raw as i64), DataType::Telemetry)
+            Value::Integer(raw as i64)
         }
         "int" => {
             // Generic "int" type - infer size from bit_length
@@ -226,13 +226,13 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<(Value, DataType)
             if raw_bytes.is_empty() {
                 return Err(GatewayError::Protocol("Empty data for int".to_string()));
             }
-            (Value::Integer(raw_bytes[0] as i64), DataType::Signal)
+            Value::Integer(raw_bytes[0] as i64)
         }
         "ascii" => {
             // Decode ASCII string, stopping at first null byte
             let s = String::from_utf8_lossy(&raw_bytes);
             let trimmed = s.trim_end_matches('\0').to_string();
-            (Value::String(trimmed), DataType::Telemetry)
+            Value::String(trimmed)
         }
         _ => {
             return Err(GatewayError::Protocol(format!(
@@ -251,5 +251,5 @@ fn decode_point(point: &CanPoint, frame_data: &[u8]) -> Result<(Value, DataType)
         other => other,
     };
 
-    Ok((final_value, data_type))
+    Ok(final_value)
 }
